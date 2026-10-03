@@ -1,0 +1,345 @@
+# Container image pipeline for SquadRules MCP.
+#
+# Builds the runtime image FROM the published @squadrules/mcp npm package (never from
+# source), scans it, and — outside pull requests — signs and publishes it to Docker Hub
+# and quay.io, promotes channel aliases, then signals SquadRules/charts.
+#
+# Decoupling contract: this pipeline is the ONLY place image build/scan/sign/publish
+# happens. An image/OS/library CVE here can never block an npm release or a code merge in
+# SquadRules/mcp. The mcp release pipeline publishes npm only and fires the
+# `npm-published` repository_dispatch that triggers this workflow.
+#
+# Triggers:
+#   - repository_dispatch[npm-published]  — fired by SquadRules/mcp after an npm publish.
+#   - schedule (hourly)                   — reconciliation against npm if a dispatch is missed.
+#   - workflow_dispatch                   — manual build for an explicit version (or latest).
+#   - pull_request                        — build + scan ONLY (no publish) so PRs that touch
+#                                           the Dockerfile/.trivyignore are gated.
+name: Container image pipeline
+
+on:
+  repository_dispatch:
+    types: [npm-published]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '@squadrules/mcp version to build (empty = latest published on npm)'
+        required: false
+        default: ''
+      force:
+        description: Rebuild and republish even if the image tag already exists
+        type: boolean
+        default: false
+      dry-run:
+        description: Build and scan only; do not sign, publish, promote, or dispatch
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main]
+    paths:
+      - 'mcp/**'
+      - '.trivyignore'
+      - '.github/workflows/build-publish.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-image-pipeline
+  cancel-in-progress: false
+
+env:
+  PACKAGE: '@squadrules/mcp'
+  # Canonical public reference used for idempotency checks and smoke tests.
+  DOCKER_IMAGE: docker.io/squadrules/mcp
+
+jobs:
+  resolve:
+    name: Resolve target version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve version and publish intent
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          pkg="@squadrules/mcp"
+
+          # Version precedence: workflow_dispatch input > repository_dispatch payload > npm latest.
+          version="${INPUT_VERSION:-${DISPATCH_VERSION:-}}"
+          if [ -z "$version" ]; then
+            version="$(npm view "$pkg" version)"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9-]+\.[0-9]+)?$'; then
+            echo "::error::Resolved version '$version' is not a valid semver"; exit 1
+          fi
+          echo "Resolved target version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Publish only outside pull requests and not during a dry run.
+          publish=true
+          if [ "$EVENT_NAME" = "pull_request" ]; then publish=false; fi
+          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then publish=false; fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+          # Idempotency: if the canonical tag already exists and this is not a forced or
+          # manual run, skip the whole pipeline (keeps the hourly reconciliation a no-op).
+          skip=false
+          if [ "$publish" = "true" ] && [ "${INPUT_FORCE:-false}" != "true" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
+            if skopeo inspect --no-tags "docker://docker.io/squadrules/mcp:${version}" >/dev/null 2>&1; then
+              echo "Image tag ${version} already published; skipping."
+              skip=true
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build, smoke-test and scan (linux/amd64 + linux/arm64)
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Install OCI transport
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
+
+      - name: Build immutable multi-platform OCI archive (from published npm)
+        run: |
+          set -euo pipefail
+          mkdir -p .local
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --target runtime \
+            --build-arg PACKAGE_VERSION="${VERSION}" \
+            --label org.opencontainers.image.version="${VERSION}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --provenance=false --sbom=false \
+            --output type=oci,dest=.local/image.oci.tar \
+            -f mcp/Dockerfile mcp
+
+      - name: Smoke-test both platforms (version assert + serve --help)
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            skopeo copy --override-os linux --override-arch "${arch}" \
+              oci-archive:.local/image.oci.tar \
+              "docker-archive:.local/scan-${arch}.tar:squadrules-scan:${arch}"
+            docker load --input ".local/scan-${arch}.tar"
+            actual="$(docker run --rm --platform "linux/${arch}" --entrypoint node "squadrules-scan:${arch}" \
+              -p "require('./node_modules/@squadrules/mcp/package.json').version")"
+            if [ "$actual" != "$VERSION" ]; then
+              echo "::error::Image ${arch} package version '$actual' != expected '$VERSION'"; exit 1
+            fi
+            docker run --rm --platform "linux/${arch}" --entrypoint node "squadrules-scan:${arch}" \
+              node_modules/@squadrules/mcp/dist/cli/index.js serve --help
+          done
+
+      - name: Compute immutable image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="sha256:$(skopeo inspect --raw oci-archive:.local/image.oci.tar | sha256sum | cut -d' ' -f1)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Image digest: ${digest}"
+
+      - name: Trivy scan amd64 (CRITICAL,HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: .local/scan-amd64.tar
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+
+      - name: Trivy scan arm64 (CRITICAL,HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: .local/scan-arm64.tar
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
+
+      - name: Persist digest for the publish job
+        if: needs.resolve.outputs.publish == 'true'
+        run: echo "${{ steps.digest.outputs.digest }}" > .local/digest.txt
+
+      - name: Upload OCI image for publication
+        if: needs.resolve.outputs.publish == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: image-oci-${{ needs.resolve.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            .local/image.oci.tar
+            .local/digest.txt
+
+  publish:
+    name: Sign, publish, promote and notify charts
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # cosign keyless signing (Fulcio OIDC)
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      QUAY_NAMESPACE: ${{ vars.QUAY_NAMESPACE }}
+      QUAY_IMAGE: quay.io/${{ vars.QUAY_NAMESPACE }}/mcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download OCI image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-oci-${{ needs.resolve.outputs.version }}
+          path: .local
+
+      - name: Install OCI transport + cosign
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to quay.io
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Publish immutable version to both registries, sign, then promote aliases
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          digest="$(cat .local/digest.txt)"
+          authfile="${HOME}/.docker/config.json"
+          targets="docker.io/squadrules/mcp ${QUAY_IMAGE}"
+
+          # 1) Push the immutable version tag to every registry (preserve the built digest).
+          for target in ${targets}; do
+            skopeo copy --all --preserve-digests --authfile "${authfile}" \
+              oci-archive:.local/image.oci.tar "docker://${target}:${VERSION}"
+          done
+
+          # 2) Cosign keyless sign + verify each published digest.
+          for target in ${targets}; do
+            cosign sign --yes "${target}@${digest}"
+            cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${target}@${digest}"
+          done
+
+          # 3) Derive channel aliases (mirrors the application repo's channelTags()):
+          #    stable X.Y.Z -> latest, X, X.Y ; prerelease X.Y.Z-<channel>.N -> <channel>.
+          case "${VERSION}" in
+            *-*)
+              channel="$(printf '%s' "${VERSION}" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([a-z0-9-]+)\.[0-9]+$/\1/')"
+              tags="${channel}"
+              ;;
+            *)
+              major="${VERSION%%.*}"; rest="${VERSION#*.}"; minor="${rest%%.*}"
+              tags="latest ${major} ${major}.${minor}"
+              ;;
+          esac
+          echo "Promoting aliases: ${tags}"
+
+          # 4) Promote aliases by copying the immutable digest to each tag (idempotent).
+          for target in ${targets}; do
+            for tag in ${tags}; do
+              skopeo copy --all --preserve-digests --authfile "${authfile}" \
+                "docker://${target}@${digest}" "docker://${target}:${tag}"
+            done
+          done
+          echo "${digest}" > .local/published-digest.txt
+
+      - name: Notify charts repository
+        # Best-effort cross-repo signal sent AFTER the image publication succeeded, so
+        # SquadRules/charts can bump the image tag/digest. Failure must not undo a
+        # published image, so this step is non-fatal.
+        continue-on-error: true
+        env:
+          CHARTS_DISPATCH_TOKEN: ${{ secrets.CHARTS_DISPATCH_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CHARTS_DISPATCH_TOKEN:-}" ]; then
+            echo "CHARTS_DISPATCH_TOKEN not configured; skipping SquadRules/charts notification."
+            exit 0
+          fi
+          digest="$(cat .local/published-digest.txt)"
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${CHARTS_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/SquadRules/charts/dispatches \
+            -d "{\"event_type\":\"image-published\",\"client_payload\":{\"version\":\"${VERSION}\",\"digest\":\"${digest}\"}}"
+
+  image-pipeline-pass:
+    name: Container image pipeline passed
+    needs: [resolve, build, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require build (and publish when publishing)
+        env:
+          RESOLVE: ${{ needs.resolve.result }}
+          BUILD: ${{ needs.build.result }}
+          PUBLISH: ${{ needs.publish.result }}
+          PUBLISH_INTENT: ${{ needs.resolve.outputs.publish }}
+          SKIP: ${{ needs.resolve.outputs.skip }}
+        run: |
+          set -euo pipefail
+          echo "resolve=$RESOLVE build=$BUILD publish=$PUBLISH publish_intent=$PUBLISH_INTENT skip=$SKIP"
+          test "$RESOLVE" = "success"
+          # A skip (already published) is a successful no-op.
+          if [ "$SKIP" = "true" ]; then
+            echo "Pipeline skipped (image already published)."; exit 0
+          fi
+          test "$BUILD" = "success"
+          if [ "$PUBLISH_INTENT" = "true" ]; then
+            test "$PUBLISH" = "success"
+          else
+            echo "Pull-request / dry-run: publish skipped is expected (result=$PUBLISH)."
+          fi
+          echo "Container image pipeline passed."

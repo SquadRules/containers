@@ -1,0 +1,23 @@
+# Active ignores (container image built FROM the published @squadrules/mcp npm package):
+# CVE-2026-12151 (undici WebSocket DoS): npm-bundled undici in the Node.js base image at
+# /usr/local/lib/node_modules/npm/node_modules/undici. The app's own undici is pinned to a
+# patched version by the Dockerfile `overrides`. Not exploitable in production (npm is not
+# used at runtime). Fix requires a Node.js base image digest update.
+# Added: 2026-07-06, review by: 2026-10-06
+CVE-2026-12151
+
+# CVE-2026-93748 (http-cache-semantics information disclosure): the runtime image installs
+# the published package with `npm install --omit=dev`, so no dev-only release tooling
+# (semantic-release -> @semantic-release/npm -> npm -> make-fetch-happen ->
+# http-cache-semantics) is present. The only remaining source is npm's OWN bundled copy in
+# the Node base image (/usr/local/lib/node_modules/npm/node_modules/http-cache-semantics).
+# It is never imported by server runtime code and npm is not used at runtime, so it is not
+# exploitable in production. No upstream fix exists (4.2.0 is the latest published version),
+# so it cannot be remediated by upgrade or npm override. Revisit when upstream ships a patch
+# or the Node base image bundles a fixed npm.
+# Added: 2026-10-03, review by: 2027-01-03
+CVE-2026-93748
+
+# Resolved:
+# CVE-2026-45447 (OpenSSL Heap Use-After-Free in PKCS7_verify) resolved:
+# node:24-alpine digest updated to include OpenSSL 3.5.7-r0.

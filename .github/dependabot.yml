@@ -1,0 +1,17 @@
+# Dependabot for the containers repo.
+#
+# Only GitHub Actions versions are tracked here. The pinned Alpine base-image digest in
+# mcp/Dockerfile is owned by the `container-base-os-trivy` job in
+# .github/workflows/security.yml (it bumps the digest on a Trivy finding), so a `docker`
+# ecosystem entry is intentionally omitted to avoid two mechanisms fighting over the
+# Dockerfile. Security updates are enabled at the repo level via IaC.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci

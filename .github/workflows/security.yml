@@ -1,0 +1,175 @@
+# Security scans for the container image repository.
+#
+#   - trivyignore-expiry    : guard that .trivyignore exp:YYYY-MM-DD entries are valid/unexpired.
+#   - container-base-os-trivy: Trivy scans the Alpine OS layer only (vuln-type=os), using the same
+#                             FROM ref + apk upgrade line as mcp/Dockerfile, and auto-remediates by
+#                             bumping the pinned base digest (PR flow: commit to the PR branch;
+#                             schedule/push flow: open an auto-merge PR). Scanning the raw digest
+#                             alone would miss the apk-upgrade layer.
+#
+# The authoritative full image+library scan (CRITICAL,HIGH) runs in build-publish.yml against the
+# actually-published artifact; this workflow shifts the base-OS fix left so that gate stays green.
+name: Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Daily 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivyignore-expiry:
+    name: Trivy ignore expiry guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TRIVYIGNORE_EXPIRY_WARNING_DAYS: "45"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate .trivyignore expiry dates
+        run: |
+          python3 scripts/ci-check-trivyignore-expiry.py \
+            --file .trivyignore \
+            --warning-days "$TRIVYIGNORE_EXPIRY_WARNING_DAYS"
+
+  container-base-os-trivy:
+    name: Base image OS (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: ${{ github.event_name == 'pull_request' }}
+          fetch-depth: 0
+
+      - name: Base image ref from Dockerfile
+        id: base
+        run: |
+          line=$(grep -m1 '^FROM ' mcp/Dockerfile)
+          ref="${line#FROM }"
+          ref="${ref%% AS *}"
+          echo "image_ref=$(echo "$ref" | xargs)" >> "$GITHUB_OUTPUT"
+          img="${ref%%@*}"
+          digest="${ref##*@}"
+          echo "image_name=$img" >> "$GITHUB_OUTPUT"
+          echo "current_digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: One-layer image (FROM + apk upgrade RUN from Dockerfile)
+        run: |
+          img="${{ steps.base.outputs.image_ref }}"
+          run_cmd=$(grep -E '^RUN apk update && apk upgrade --no-cache$' mcp/Dockerfile | sed 's/^RUN //' | head -1)
+          if [ -z "$run_cmd" ]; then echo "::error::Expected \"RUN apk update && apk upgrade --no-cache\" line in mcp/Dockerfile"; exit 1; fi
+          printf 'FROM %s\nRUN %s\n' "$img" "$run_cmd" | docker build -t squadrules-os:ci -
+
+      - name: Trivy scan (attempt)
+        id: trivy-scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: squadrules-os:ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          vuln-type: os
+
+      - name: Auto-remediate base image
+        if: steps.trivy-scan.outcome == 'failure'
+        id: remediate
+        run: |
+          set -euo pipefail
+          img_name="${{ steps.base.outputs.image_name }}"
+
+          echo "::warning::Trivy found vulnerabilities, attempting base image update..."
+
+          docker pull "$img_name" --quiet
+          new_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$img_name" | sed 's/.*@//')
+          old_digest="${{ steps.base.outputs.current_digest }}"
+
+          if [ "$new_digest" = "$old_digest" ]; then
+            echo "::error::Base image is already at latest digest but still has vulnerabilities"
+            exit 1
+          fi
+
+          echo "Updating mcp/Dockerfile: $old_digest -> $new_digest"
+          sed -i "s|$old_digest|$new_digest|g" mcp/Dockerfile
+
+          run_cmd=$(grep -E '^RUN apk update && apk upgrade --no-cache$' mcp/Dockerfile | sed 's/^RUN //' | head -1)
+          printf 'FROM %s\nRUN %s\n' "$img_name@$new_digest" "$run_cmd" | docker build -t squadrules-os:ci -
+
+          echo "new_digest=$new_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy rescan (verify remediation)
+        if: steps.trivy-scan.outcome == 'failure'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: squadrules-os:ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          vuln-type: os
+
+      - name: Commit base image update
+        if: steps.trivy-scan.outcome == 'failure' && success()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git add mcp/Dockerfile
+            git commit -m "fix(docker): auto-update base image to remediate Trivy vulnerabilities"
+            git push origin HEAD:"$HEAD_REF"
+            echo "Committed base image update to PR branch"
+          else
+            BRANCH="auto/trivy-base-image-$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$BRANCH"
+            git add mcp/Dockerfile
+            git commit -m "fix(docker): auto-update base image to remediate Trivy vulnerabilities"
+            git push -u origin "$BRANCH"
+            PR_URL=$(gh pr create --title "fix(docker): auto-update base image to remediate Trivy vulnerabilities" \
+                         --body "Automated base image update from scheduled security scan." \
+                         --label "dependencies")
+            gh pr merge --auto --squash "$PR_URL"
+            echo "Opened PR with base image update (auto-merge enabled)"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+
+  # Merge gate: all security jobs must pass.
+  security-pass:
+    name: Security workflow passed
+    needs: [trivyignore-expiry, container-base-os-trivy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs
+        env:
+          TRIVYIGNORE_EXPIRY: ${{ needs.trivyignore-expiry.result }}
+          CONTAINER_TRIVY: ${{ needs.container-base-os-trivy.result }}
+        run: |
+          set -euo pipefail
+          echo "trivyignore-expiry=$TRIVYIGNORE_EXPIRY container-base-os-trivy=$CONTAINER_TRIVY"
+          test "$TRIVYIGNORE_EXPIRY" = "success"
+          test "$CONTAINER_TRIVY" = "success"
+          echo "All security jobs passed."

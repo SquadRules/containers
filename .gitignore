@@ -1,0 +1,8 @@
+# Build/scan scratch space used by the pipeline (OCI archives, per-arch docker-archive tars).
+.local/
+*.tar
+*.oci.tar
+
+# OS / editor noise
+.DS_Store
+*.swp
