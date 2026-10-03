@@ -13,8 +13,11 @@
 #   - repository_dispatch[npm-published]  — fired by SquadRules/mcp after an npm publish.
 #   - schedule (hourly)                   — reconciliation against npm if a dispatch is missed.
 #   - workflow_dispatch                   — manual build for an explicit version (or latest).
-#   - pull_request                        — build + scan ONLY (no publish) so PRs that touch
-#                                           the Dockerfile/.trivyignore are gated.
+#   - pull_request                        — build + scan ONLY (no publish) on every PR, so the
+#                                           "Container image pipeline passed" aggregate always
+#                                           reports and can serve as a required branch-protection
+#                                           check (a paths filter would strand non-image PRs on a
+#                                           required check that never runs).
 name: Container image pipeline
 
 on:
@@ -38,10 +41,6 @@ on:
         default: false
   pull_request:
     branches: [main]
-    paths:
-      - 'mcp/**'
-      - '.trivyignore'
-      - '.github/workflows/build-publish.yml'
 
 permissions:
   contents: read
