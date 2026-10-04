@@ -39,10 +39,8 @@ published npm version, so the same version always produces the same image.
 [`.github/workflows/build-publish.yml`](.github/workflows/build-publish.yml) — the image
 pipeline. Triggers:
 
-- **`repository_dispatch[npm-published]`** — fired by `SquadRules/mcp` right after an npm
-  publish (the primary path).
-- **`schedule` (hourly)** — reconciliation against npm `latest`, so a missed dispatch still
-  produces the image. No-op when the tag already exists.
+- **`schedule` (hourly)** — reconciliation against npm `latest`. No-op when the tag already
+  exists.
 - **`workflow_dispatch`** — manual build for an explicit `version` (or latest), with `force`
   and `dry-run` flags.
 - **`pull_request`** — build + scan **only** (no publish) to gate Dockerfile/`.trivyignore`
@@ -50,8 +48,7 @@ pipeline. Triggers:
 
 Steps: resolve version → `docker buildx build` (multi-arch OCI) → per-arch smoke
 (`serve --help` + version assert) → Trivy `CRITICAL,HIGH` per arch (`.trivyignore`) →
-`skopeo copy` to both registries → `cosign sign`/`verify` → promote aliases →
-`repository_dispatch[image-published]` `{version,digest}` to `SquadRules/charts`.
+`skopeo copy` to both registries → `cosign sign`/`verify` → promote aliases.
 
 [`.github/workflows/security.yml`](.github/workflows/security.yml) — `.trivyignore` expiry
 guard and the base-image OS Trivy scan that auto-remediates by bumping the pinned base
@@ -65,7 +62,6 @@ Secrets (repo → Settings → Secrets and variables → Actions):
 |---|---|
 | `DOCKER_USERNAME` / `DOCKER_PASSWORD` | Docker Hub push |
 | `QUAY_USERNAME` / `QUAY_PASSWORD` | quay.io push |
-| `CHARTS_DISPATCH_TOKEN` | narrowly-scoped token to `repository_dispatch` `SquadRules/charts` |
 
 Variables:
 
