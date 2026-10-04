@@ -2,16 +2,15 @@
 #
 # Builds the runtime image FROM the published @squadrules/mcp npm package (never from
 # source), scans it, and — outside pull requests — signs and publishes it to Docker Hub
-# and quay.io, promotes channel aliases, then signals SquadRules/charts.
+# and quay.io, then promotes channel aliases.
 #
 # Decoupling contract: this pipeline is the ONLY place image build/scan/sign/publish
 # happens. An image/OS/library CVE here can never block an npm release or a code merge in
-# SquadRules/mcp. The mcp release pipeline publishes npm only and fires the
-# `npm-published` repository_dispatch that triggers this workflow.
+# SquadRules/mcp. The mcp release pipeline publishes npm only; this repo builds images
+# independently via schedule (hourly npm poll), workflow_dispatch, or pull_request.
 #
 # Triggers:
-#   - repository_dispatch[npm-published]  — fired by SquadRules/mcp after an npm publish.
-#   - schedule (hourly)                   — reconciliation against npm if a dispatch is missed.
+#   - schedule (hourly)                   — reconciliation against npm latest.
 #   - workflow_dispatch                   — manual build for an explicit version (or latest).
 #   - pull_request                        — build + scan ONLY (no publish) on every PR, so the
 #                                           "Container image pipeline passed" aggregate always
@@ -21,8 +20,6 @@
 name: Container image pipeline
 
 on:
-  repository_dispatch:
-    types: [npm-published]
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
@@ -67,7 +64,6 @@ jobs:
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
-          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_FORCE: ${{ inputs.force }}
           INPUT_DRY_RUN: ${{ inputs.dry-run }}
@@ -75,8 +71,8 @@ jobs:
           set -euo pipefail
           pkg="@squadrules/mcp"
 
-          # Version precedence: workflow_dispatch input > repository_dispatch payload > npm latest.
-          version="${INPUT_VERSION:-${DISPATCH_VERSION:-}}"
+          # Version precedence: workflow_dispatch input > npm latest.
+          version="${INPUT_VERSION:-}"
           if [ -z "$version" ]; then
             version="$(npm view "$pkg" version)"
           fi
@@ -293,26 +289,6 @@ jobs:
             done
           done
           echo "${digest}" > .local/published-digest.txt
-
-      - name: Notify charts repository
-        # Best-effort cross-repo signal sent AFTER the image publication succeeded, so
-        # SquadRules/charts can bump the image tag/digest. Failure must not undo a
-        # published image, so this step is non-fatal.
-        continue-on-error: true
-        env:
-          CHARTS_DISPATCH_TOKEN: ${{ secrets.CHARTS_DISPATCH_TOKEN }}
-        run: |
-          set -uo pipefail
-          if [ -z "${CHARTS_DISPATCH_TOKEN:-}" ]; then
-            echo "CHARTS_DISPATCH_TOKEN not configured; skipping SquadRules/charts notification."
-            exit 0
-          fi
-          digest="$(cat .local/published-digest.txt)"
-          curl -sf -X POST \
-            -H "Authorization: Bearer ${CHARTS_DISPATCH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/SquadRules/charts/dispatches \
-            -d "{\"event_type\":\"image-published\",\"client_payload\":{\"version\":\"${VERSION}\",\"digest\":\"${digest}\"}}"
 
   image-pipeline-pass:
     name: Container image pipeline passed
