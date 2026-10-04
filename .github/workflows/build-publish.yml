@@ -188,7 +188,7 @@ jobs:
 
       - name: Upload OCI image for publication
         if: needs.resolve.outputs.publish == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: image-oci-${{ needs.resolve.outputs.version }}
           if-no-files-found: error
