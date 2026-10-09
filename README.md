@@ -207,6 +207,24 @@ cosign verify \
   docker.io/squadrules/mcp:<version>
 ```
 
+## Architecture decisions
+
+Architecturally significant decisions are recorded as [Architecture Decision
+Records (ADRs)](docs/adr/). Each ADR captures the context, the decision, and the
+consequences (trade-offs, follow-ups, constraints). New ADRs are added as the
+project evolves; superseded ADRs are marked `deprecated` and linked forward.
+
+Current ADRs:
+
+- [0001](docs/adr/0001-node24-bookworm-slim-base.md) — Node 24 LTS on Debian bookworm-slim as the base image
+- [0002](docs/adr/0002-simple-by-default-runtime.md) — SIMPLE-by-default runtime contract
+- [0003](docs/adr/0003-digest-pin-plus-upgrade-layer.md) — Digest pin plus apt-get upgrade layer and expiring-ignore risk register
+- [0004](docs/adr/0004-baked-embedding-model.md) — Baked ONNX embedding model
+- [0005](docs/adr/0005-npm-cli-removed-from-runtime.md) — npm CLI removed from the runtime image
+- [0006](docs/adr/0006-mode-aware-healthcheck.md) — Mode-aware healthcheck
+- [0007](docs/adr/0007-sboms-as-artifacts.md) — SPDX SBOMs as CI artifacts, not registry attachments
+- [0008](docs/adr/0008-os-base-scan-target.md) — OS base scan target
+
 ## Repository provisioning
 
 This repo is declared as code in
