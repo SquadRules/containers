@@ -1,23 +1,66 @@
-# Active ignores (container image built FROM the published @squadrules/mcp npm package):
-# CVE-2026-12151 (undici WebSocket DoS): npm-bundled undici in the Node.js base image at
-# /usr/local/lib/node_modules/npm/node_modules/undici. The app's own undici is pinned to a
-# patched version by the Dockerfile `overrides`. Not exploitable in production (npm is not
-# used at runtime). Fix requires a Node.js base image digest update.
-# Added: 2026-07-06, review by: 2026-10-06
-CVE-2026-12151
+# Active ignores — container image built FROM the published @squadrules/mcp npm package.
+#
+# Everything below is a Debian bookworm OS finding for which the Debian tracker has no fix to
+# take (status `affected`, `fix_deferred` or `will_not_fix`), so neither the pinned base digest
+# nor the runtime stage's `apt-get upgrade` layer can close it. Each entry carries an expiring
+# review date, validated by scripts/ci-check-trivyignore-expiry.py in the Security workflow.
+# None of these packages is loaded by the Node.js server, and the container runs as the
+# unprivileged `node` user (uid 1000) with no capabilities in the chart's securityContext.
+#
+# util-linux family (mount/bsdutils/libblkid1/libmount1/libsmartcols1/libuuid1/util-linux/
+# util-linux-extra — one source package, eight binary packages per CVE): local issues in
+# mount/nsenter/agetty/libmount path handling. Reaching them means executing those root/setuid
+# binaries, which the server never does (it spawns no processes: shell challenges run on the
+# agent's own host) and which a non-root, capability-dropped container cannot do.
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2026-53613 exp:2027-04-01
+CVE-2026-76642 exp:2027-04-01
+CVE-2026-78408 exp:2027-04-01
+CVE-2026-78409 exp:2027-04-01
+CVE-2026-78410 exp:2027-04-01
 
-# CVE-2026-93748 (http-cache-semantics information disclosure): the runtime image installs
-# the published package with `npm install --omit=dev`, so no dev-only release tooling
-# (semantic-release -> @semantic-release/npm -> npm -> make-fetch-happen ->
-# http-cache-semantics) is present. The only remaining source is npm's OWN bundled copy in
-# the Node base image (/usr/local/lib/node_modules/npm/node_modules/http-cache-semantics).
-# It is never imported by server runtime code and npm is not used at runtime, so it is not
-# exploitable in production. No upstream fix exists (4.2.0 is the latest published version),
-# so it cannot be remediated by upgrade or npm override. Revisit when upstream ships a patch
-# or the Node base image bundles a fixed npm.
-# Added: 2026-10-03, review by: 2027-01-03
-CVE-2026-93748
+# CVE-2025-69720 (ncurses/libtinfo6/ncurses-bin): terminfo parsing. `libtinfo6` is a hard
+# dependency of bash (Essential), so it cannot be removed from a Debian base image; nothing in
+# the runtime reads a terminfo database (the server is a headless Node process).
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2025-69720 exp:2027-04-01
+
+# CVE-2026-16742 (libsystemd0/libudev1): pulled in as a util-linux dependency; the image runs no
+# systemd/udev client code.
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2026-16742 exp:2027-04-01
+
+# CVE-2026-41992 (gzip): the gzip CLI is only used by apt/dpkg at build time and is never
+# invoked at runtime (no npm, no archive handling in the server).
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2026-41992 exp:2027-04-01
+
+# CVE-2026-54369 (libacl1): used by mount/tar-style tooling; not in the server's load path.
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2026-54369 exp:2027-04-01
+
+# CVE-2026-9538 (perl-base): Debian has deferred the fix; Perl is present only because it is
+# Essential in the base image and the server never spawns it (the runtime image also has no npm,
+# so no registry tooling can shell out to it).
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2026-9538 exp:2027-04-01
+
+# CVE-2023-45853 (zlib1g, CRITICAL): `will_not_fix` in Debian bookworm — the 1.2.13 zip64
+# handling issue is only resolved by the zlib 1.3.x rebundle, which bookworm will not ship. The
+# Node binary does not link the system zlib (its `ldd` shows only libc/libstdc++/libm/libgcc and
+# it bundles its own zlib+OpenSSL), so the server never loads this library; the file is only
+# reached through apt/dpkg at build time. Accepted because no action exists inside a bookworm
+# base: it disappears when the base moves to a Debian release carrying zlib 1.3.
+# Added: 2026-10-08, review by: 2027-04-01
+CVE-2023-45853 exp:2027-04-01
 
 # Resolved:
+# CVE-2026-12151 (undici WebSocket DoS) and CVE-2026-93748 (http-cache-semantics information
+# disclosure) removed without a code change: both were npm-bundled libraries in
+# /usr/local/lib/node_modules/npm, and the runtime stage now deletes the npm CLI entirely, so
+# they no longer appear in the image at all (verified with Trivy against the built image).
+# CVE-2026-13221, CVE-2026-42496, CVE-2026-42497, CVE-2026-48962, CVE-2026-57432,
+# CVE-2026-57433, CVE-2026-8376 (perl-base): fixed by the `apt-get upgrade` layer in the
+# os-base stage (perl-base 5.36.0-7+deb12u3 -> 5.36.0-7+deb12u4); no ignore needed.
 # CVE-2026-45447 (OpenSSL Heap Use-After-Free in PKCS7_verify) resolved:
 # node:24-alpine digest updated to include OpenSSL 3.5.7-r0.

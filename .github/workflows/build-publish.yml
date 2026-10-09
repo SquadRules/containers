@@ -12,9 +12,9 @@
 # Triggers:
 #   - schedule (hourly)                   — reconciliation against npm latest.
 #   - workflow_dispatch                   — manual build for an explicit version (or latest).
-#   - pull_request                        — build + scan ONLY (no publish) on every PR, so the
-#                                           "Container image pipeline passed" aggregate always
-#                                           reports and can serve as a required branch-protection
+#   - pull_request                        — build + smoke-test + scan ONLY (no publish) on every
+#                                           PR, so the "Container image pipeline passed" aggregate
+#                                           always reports and can serve as a required branch-protection
 #                                           check (a paths filter would strand non-image PRs on a
 #                                           required check that never runs).
 name: Container image pipeline
@@ -105,7 +105,10 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The per-arch smoke boots a real server twice, once of them under QEMU, and startup is
+    # CPU-bound ONNX embedding work — the 45 min that was enough for a `serve --help` assert
+    # is not enough for an emulated cold boot.
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
     steps:
@@ -128,14 +131,13 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --target runtime \
             --build-arg PACKAGE_VERSION="${VERSION}" \
-            --label org.opencontainers.image.version="${VERSION}" \
-            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
-            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --build-arg BUILD_REVISION="${GITHUB_SHA}" \
+            --build-arg BUILD_SOURCE="https://github.com/${GITHUB_REPOSITORY}" \
             --provenance=false --sbom=false \
             --output type=oci,dest=.local/image.oci.tar \
             -f mcp/Dockerfile mcp
 
-      - name: Smoke-test both platforms (version assert + serve --help)
+      - name: Smoke-test both platforms (version, baked model, SIMPLE stdio, CLUSTER http)
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
@@ -143,13 +145,12 @@ jobs:
               oci-archive:.local/image.oci.tar \
               "docker-archive:.local/scan-${arch}.tar:squadrules-scan:${arch}"
             docker load --input ".local/scan-${arch}.tar"
-            actual="$(docker run --rm --platform "linux/${arch}" --entrypoint node "squadrules-scan:${arch}" \
-              -p "require('./node_modules/@squadrules/mcp/package.json').version")"
-            if [ "$actual" != "$VERSION" ]; then
-              echo "::error::Image ${arch} package version '$actual' != expected '$VERSION'"; exit 1
-            fi
-            docker run --rm --platform "linux/${arch}" --entrypoint node "squadrules-scan:${arch}" \
-              node_modules/@squadrules/mcp/dist/cli/index.js serve --help
+            # scripts/ci-smoke-image.sh proves the two runtime modes on this architecture:
+            # an MCP initialize/tools/list handshake over stdio with an EMPTY environment
+            # (which loads the per-arch native modules and the baked embedding model) and a
+            # TRANSPORT_TYPE=http boot that serves /health and stops on SIGTERM.
+            ./scripts/ci-smoke-image.sh "squadrules-scan:${arch}" "${VERSION}" \
+              --platform "linux/${arch}"
           done
 
       - name: Compute immutable image digest
@@ -177,6 +178,37 @@ jobs:
           exit-code: '1'
           severity: CRITICAL,HIGH
           trivyignores: .trivyignore
+
+      # SPDX SBOMs are build artifacts, not registry attachments: `skopeo copy --all
+      # --preserve-digests` would change the published digest if attestations were pushed
+      # with the image, and the pipeline's whole point is publishing the built digest.
+      # Unfiltered (no severity limit, no .trivyignore, every package whether or not it has a
+      # CVE) — an SBOM is an inventory, and a suppressed finding must stay visible in it.
+      - name: Generate SPDX SBOM (amd64)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: .local/scan-amd64.tar
+          scanners: vuln
+          format: spdx-json
+          output: .local/sbom-amd64.spdx.json
+          list-all-pkgs: 'true'
+
+      - name: Generate SPDX SBOM (arm64)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: .local/scan-arm64.tar
+          scanners: vuln
+          format: spdx-json
+          output: .local/sbom-arm64.spdx.json
+          list-all-pkgs: 'true'
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v5
+        with:
+          name: sbom-${{ needs.resolve.outputs.version }}
+          if-no-files-found: error
+          retention-days: 90
+          path: .local/sbom-*.spdx.json
 
       - name: Persist digest for the publish job
         if: needs.resolve.outputs.publish == 'true'
