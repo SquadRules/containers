@@ -54,6 +54,17 @@ CVE-2026-9538 exp:2027-04-01
 # Added: 2026-10-08, review by: 2027-04-01
 CVE-2023-45853 exp:2027-04-01
 
+# CVE-2026-88647 / CVE-2026-88648 (libgnutls30, HIGH): gnutls TLS issues — information
+# disclosure via hostname, and cross-domain certificate restriction bypass. `libgnutls30`'s only
+# installed reverse dependency is `apt`, which uses it for HTTPS package mirrors at BUILD time;
+# the runtime stage never invokes apt. The Node server links no system gnutls (it bundles its own
+# OpenSSL) and makes all outbound HTTPS calls through Node/undici, so neither CVE is in the
+# server's load path. Debian bookworm has no fixed package yet (status `affected`), so neither the
+# pinned base digest nor the `apt-get upgrade` layer can close it.
+# Added: 2026-10-12, review by: 2027-04-01
+CVE-2026-88647 exp:2027-04-01
+CVE-2026-88648 exp:2027-04-01
+
 # Resolved:
 # CVE-2026-12151 (undici WebSocket DoS) and CVE-2026-93748 (http-cache-semantics information
 # disclosure) removed without a code change: both were npm-bundled libraries in
