@@ -7,12 +7,13 @@
 #
 #   1. package version inside the image matches the npm version it was built from;
 #   2. the embedding model is baked in, so a boot never depends on registry egress;
-#   3. SIMPLE mode — the published default CMD with an EMPTY environment must answer an MCP
-#      initialize/tools/list handshake over stdio. This is the only check that proves the
-#      stdio transport, the embedded LanceDB store and the native fastembed/onnxruntime
-#      modules actually load on this architecture (npm optional platform deps are per-arch);
-#   4. CLUSTER mode — TRANSPORT_TYPE=http must bring up /health and report the backend it
-#      chose, then shut down on SIGTERM without being killed on timeout.
+#   3. stdio override — TRANSPORT_TYPE=stdio must answer an MCP initialize/tools/list handshake
+#      over stdin/stdout. This is the check that proves the stdio transport and the native
+#      fastembed/onnxruntime modules actually load on this architecture (npm optional platform
+#      deps are per-arch);
+#   4. default (zero env) — the image's baked TRANSPORT_TYPE=http / AUTH_ENABLED=false must
+#      bring up /health on an EMPTY environment, report the embedded LanceDB backend, then shut
+#      down on SIGTERM without being killed on timeout.
 #
 # Usage: ci-smoke-image.sh <image-ref> <expected-package-version> [--platform <platform>]
 #
@@ -21,16 +22,40 @@
 # native. Override with SMOKE_SIMPLE_DEADLINE / SMOKE_CLUSTER_DEADLINE.
 set -euo pipefail
 
-IMAGE="${1:-}"
-VERSION="${2:-}"
-PLATFORM="${3:-}"
 usage() {
     echo "usage: $(basename "$0") <image-ref> <expected-package-version> [--platform <platform>]" >&2
     exit 2
 }
+
+# Accept the platform both as `--platform <value>` (the form the pipeline uses) and as
+# `--platform=<value>`; the image ref and expected version are positional in any order
+# relative to the flag. A naive `$1/$2/$3` read would drop the value that follows a bare
+# `--platform` and fall through to usage.
+IMAGE=""
+VERSION=""
+PLATFORM=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --platform)
+            [ $# -ge 2 ] || usage
+            PLATFORM="$2"
+            shift 2
+            ;;
+        --platform=*)
+            PLATFORM="${1#--platform=}"
+            shift
+            ;;
+        *)
+            if [ -z "$IMAGE" ]; then IMAGE="$1"
+            elif [ -z "$VERSION" ]; then VERSION="$1"
+            else usage
+            fi
+            shift
+            ;;
+    esac
+done
 [ -n "$IMAGE" ] && [ -n "$VERSION" ] || usage
-case "$PLATFORM" in --platform=*) PLATFORM="${PLATFORM#--platform=}" ;; esac
-if [ "$PLATFORM" = "--platform" ]; then usage; fi
+[ -n "$PLATFORM" ] || PLATFORM=""
 
 # The architecture is always pinned explicitly: it names the platform that was actually
 # exercised in the log, and a non-empty RUN_ARGS keeps `set -u` working on bash 3.2 (macOS),
@@ -99,7 +124,7 @@ if [ -z "$model_dir" ]; then
 fi
 echo "ok: ${model_dir}"
 
-say "3) SIMPLE mode: MCP handshake over stdio with an empty environment"
+say "3) stdio override: MCP handshake over stdin/stdout (TRANSPORT_TYPE=stdio)"
 # Startup is the slow part (bundled-adapter injection through the local ONNX model), so the
 # response — not a fixed sleep — decides when we are done. stdin is held open on a fifo for the
 # whole leg: a client keeps the pipe of a stdio MCP server alive, so the container is named and
@@ -109,7 +134,8 @@ INITIALIZED='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 TOOLS_LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 simple_cid="squadrules-smoke-simple-${RANDOM}"
 mkfifo "$WORKDIR_TMP/simple-stdin"
-docker run -i --rm --init --name "$simple_cid" "${RUN_ARGS[@]}" "$IMAGE" \
+docker run -i --rm --init --name "$simple_cid" "${RUN_ARGS[@]}" \
+    -e TRANSPORT_TYPE=stdio "$IMAGE" \
     < "$WORKDIR_TMP/simple-stdin" > "$WORKDIR_TMP/simple-out" 2> "$WORKDIR_TMP/simple-err" &
 simple_pid=$!
 CONTAINERS+=("$simple_cid")
@@ -131,28 +157,31 @@ done
 
 exec 9>&- || true
 if [ "$handshake" != yes ]; then
-    echo "::error::SIMPLE mode never answered the MCP handshake (initialize + tools/list)" >&2
+    echo "::error::stdio mode never answered the MCP handshake (initialize + tools/list)" >&2
     echo "::error::stdout was $(wc -c < "$WORKDIR_TMP/simple-out") byte(s) within ${SMOKE_SIMPLE_DEADLINE:-600}s" >&2
     tail -40 "$WORKDIR_TMP/simple-err" >&2 || true
     exit 1
 fi
-# A stdio server must not open a listener; the banner is the assertion that it did not.
-if ! grep -q 'no HTTP listener' "$WORKDIR_TMP/simple-err"; then
-    echo "::error::expected the stdio banner ('no HTTP listener') on stderr" >&2
+# A stdio server must not open a listener; the banner is the assertion that it did not. The
+# banner line is `  http:       no listener (...)` (see mcp stdio-banner.ts); match it with a
+# spacing-tolerant regex so a re-indent there does not silently break this leg.
+if ! grep -qE 'http:[[:space:]]+no listener' "$WORKDIR_TMP/simple-err"; then
+    echo "::error::expected the stdio banner ('http: no listener') on stderr" >&2
     tail -20 "$WORKDIR_TMP/simple-err" >&2 || true
     exit 1
 fi
-echo "ok: initialize + tools/list served over stdio, no HTTP listener"
-stop_measured "$simple_cid" SIMPLE || exit 1
+echo "ok: initialize + tools/list served over stdio, no listener opened"
+stop_measured "$simple_cid" stdio || exit 1
 # `--rm` already removed the container; the entry stays in CONTAINERS so an early exit between
 # stop and reap still cleans up (docker rm -f on a gone container is silently ignored).
 wait "$simple_pid" 2>/dev/null || true   # reaped after docker stop; exit status is the signal's
 
-say "4) CLUSTER mode: TRANSPORT_TYPE=http boots, serves /health, stops on signal"
-cluster_cid="$(docker run -d --init "${RUN_ARGS[@]}" --name "squadrules-smoke-cluster-${RANDOM}" \
+say "4) default (zero env): HTTP transport boots, serves /health, stops on signal"
+# No -e flags: this leg proves the image's baked default (TRANSPORT_TYPE=http, AUTH_ENABLED=false)
+# boots a reachable, self-contained server on an empty environment. Reaching /health 200 with no
+# Keycloak vars at all is also the proof that auth is off by default (auth-on would fail startup).
+cluster_cid="$(docker run -d --init "${RUN_ARGS[@]}" --name "squadrules-smoke-default-${RANDOM}" \
     -p 127.0.0.1::3000 \
-    -e TRANSPORT_TYPE=http \
-    -e AUTH_ENABLED=false \
     "$IMAGE")"
 CONTAINERS+=("$cluster_cid")
 host_port="$(docker port "$cluster_cid" 3000/tcp | head -1 | sed 's/.*://')"
@@ -163,7 +192,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
     health="$(curl -fsS --max-time 5 "http://127.0.0.1:${host_port}/health" 2>/dev/null || true)"
     [ -n "$health" ] && break
     if ! docker inspect -f '{{.State.Running}}' "$cluster_cid" | grep -q true; then
-        echo "::error::CLUSTER-mode container exited before serving /health" >&2
+        echo "::error::default-mode container exited before serving /health" >&2
         docker logs --tail 40 "$cluster_cid" >&2 || true
         exit 1
     fi
@@ -183,7 +212,7 @@ process.stdin.on("end", () => {
   if (h.status !== "healthy") problems.push("status=" + h.status);
   if (h.transport !== "http") problems.push("transport=" + h.transport);
   const backend = (h.details || {}).vectorStoreBackend || "";
-  // With no QDRANT_URL the env override selects the embedded store; that is the contract.
+  // With no QDRANT_URL the baked http default selects the embedded store; that is the contract.
   if (backend !== "embedded-lancedb") problems.push("vectorStoreBackend=" + backend);
   if (problems.length) { console.error(problems.join(", ")); process.exit(1); }
   console.log("ok: /healthy over http, backend=" + backend);
@@ -194,6 +223,6 @@ process.stdin.on("end", () => {
 }
 
 # Graceful shutdown (see stop_measured).
-stop_measured "$cluster_cid" CLUSTER || exit 1
+stop_measured "$cluster_cid" default || exit 1
 
 say "smoke passed for ${IMAGE}${PLATFORM:+ (${PLATFORM})}"

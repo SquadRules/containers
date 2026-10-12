@@ -6,17 +6,20 @@
 # node_modules leaves the image, so this is a pure packaging of an already-published,
 # already-released version.
 #
-# Runtime modes — this image deliberately bakes NO mode-selecting environment:
+# Runtime modes — the container defaults to the HTTP server posture:
 #
-#   * SIMPLE (the default): run the image with an empty environment. The CMD is the
-#     `squadrules serve` entrypoint, which defaults to the stdio transport, and the app
-#     then selects embedded LanceDB (no QDRANT_URL), authentication off, and the local
-#     key-free fastembed model. MCP speaks JSON-RPC on stdin/stdout, so a container must
-#     be attached (`docker run -i`); there is no HTTP listener and no port to publish.
-#   * CLUSTER: override any setting through the environment. `TRANSPORT_TYPE=http` makes
-#     the process an HTTP server (UI, /api, /mcp, /health, metrics); a non-empty
-#     QDRANT_URL / KEY_VALUE_STORE_URL / AUTH_ENABLED=true switch the backing stores and
-#     turn on OIDC. `docker exec`-style probes and Helm/Kubernetes liveness then apply.
+#   * Default (zero env): TRANSPORT_TYPE=http and AUTH_ENABLED=false are baked in, so an
+#     environment-less `docker run` boots a self-contained HTTP server on :3000 (UI, /api,
+#     /mcp, /health, metrics) backed by embedded LanceDB and the local key-free fastembed
+#     model — no external dependencies, no auth. This matches the app's own rule that a
+#     container CMD keeps the historical `http` default (see resolveTransportType);
+#     AUTH_ENABLED is pinned off because under http it would otherwise default to on and
+#     refuse to boot without Keycloak. Publish the port (`-p 3000:3000`) to reach it.
+#   * stdio (local agent): override with `-e TRANSPORT_TYPE=stdio` for the single-user MCP
+#     server an agent host spawns — JSON-RPC on stdin/stdout (`docker run -i`), no listener.
+#   * Full cluster: add `-e AUTH_ENABLED=true` plus QDRANT_URL / KEY_VALUE_STORE_URL /
+#     KEYCLOAK_* to move to external stores and turn on OIDC. Every setting stays
+#     env-overridable, and `docker exec`-style probes and Helm/Kubernetes liveness apply.
 #
 # Node policy: Node.js 24 is the Active LTS line (it is what `node:lts` resolves to, and
 # what SquadRules/mcp `.nvmrc` / `engines` declare). Non-LTS Current is exercised in the
@@ -55,7 +58,7 @@ RUN test -n "$PACKAGE_VERSION" || (echo "Build-arg PACKAGE_VERSION is required" 
 # and a caret on 0.0.x resolves to exactly 0.0.0, whose universal stub ships binaries only
 # for darwin-universal / linux-x64-gnu / win32-x64-msvc. There is no linux-arm64 build at
 # 0.0.0, so `import('fastembed')` throws MODULE_NOT_FOUND on linux/arm64 and the key-free
-# local embedding path — i.e. SIMPLE mode — cannot work on arm64 images at all. 0.6.0 is
+# local embedding path cannot work on arm64 images at all. 0.6.0 is
 # the same napi project with linux-arm64-gnu/musl added, so it is forced here. Fix at
 # source in SquadRules/mcp (dependency bump or override) and delete this line once a
 # released @squadrules/mcp carries it.
@@ -72,7 +75,7 @@ FROM deps AS model
 WORKDIR /app
 
 # The zero-config embedding backend downloads ONNX weights on first use. Fetching them
-# here instead makes the image self-contained: a CLUSTER boot on a read-only root
+# here instead makes the image self-contained: the default HTTP boot on a read-only root
 # filesystem, or an air-gapped node, then needs no Hugging Face egress and pays no
 # first-request latency. Kept out of the mutable config tree so mounting
 # ~/.config/squadrules (for the embedded LanceDB store) cannot shadow the weights.
@@ -133,28 +136,34 @@ RUN set -eux; \
     test ! -e /usr/local/bin/npm; \
     du -sh "${MODEL_CACHE_DIR}"
 
-# Documentation only — EXPOSE carries no enforcement, and the ports are unused in SIMPLE
-# mode because a stdio server opens no listener. Values mirror the app defaults
-# (SERVER_PORT 3000, METRICS_PORT 9090); both are overridable by environment in CLUSTER.
+# Documentation only — EXPOSE carries no enforcement. With the http default the server
+# listens on 3000 (metrics on 9090); both mirror the app defaults (SERVER_PORT 3000,
+# METRICS_PORT 9090) and are overridable by environment. Under a TRANSPORT_TYPE=stdio
+# override no listener is opened and these ports are unused.
 EXPOSE 3000 9090
 
-# Only two environment variables are set, and neither selects a runtime mode: NODE_ENV is
-# the usual production switch, and FASTEMBED_CACHE_DIR points at the baked weights (kept
-# outside ~/.config/squadrules so mounting that directory for the embedded LanceDB store
-# cannot shadow them). Both track the build args above rather than duplicating literals.
+# NODE_ENV is the usual production switch and FASTEMBED_CACHE_DIR points at the baked weights
+# (kept outside ~/.config/squadrules so mounting that directory for the embedded LanceDB store
+# cannot shadow them). TRANSPORT_TYPE=http and AUTH_ENABLED=false make the zero-env default a
+# self-contained HTTP server: http is the app's container-CMD default, and AUTH_ENABLED is
+# pinned off because under http it would otherwise default to on and refuse to boot without
+# Keycloak. All four are overridable at `docker run` — e.g. `-e TRANSPORT_TYPE=stdio` for the
+# local agent posture, or `-e AUTH_ENABLED=true` plus the OIDC vars for a full cluster.
 ENV NODE_ENV=production \
-    FASTEMBED_CACHE_DIR=${MODEL_CACHE_DIR}
+    FASTEMBED_CACHE_DIR=${MODEL_CACHE_DIR} \
+    TRANSPORT_TYPE=http \
+    AUTH_ENABLED=false
 
 # Built-in `node` user (uid/gid 1000) — no root, no new user, and it matches the
 # runAsUser: 1000 that the SquadRules/charts pod securityContext already enforces.
 USER node
 
-# Mode-aware healthcheck. A stdio process has no socket to probe, so the check is a no-op
-# there (Docker reports healthy as long as the process is up) and only verifies /health
-# once an HTTP transport is configured. start-period is sized for the measured cold boot of
-# a CLUSTER container (~110s on an arm64 laptop): /health only answers after startup has
-# injected the bundled adapters, which is CPU-bound ONNX embedding on the local model.
-# Kubernetes ignores this instruction — SquadRules/charts owns pod probes.
+# Mode-aware healthcheck. The http default means this probes /health out of the box; under a
+# TRANSPORT_TYPE=stdio override there is no socket, so the check no-ops (Docker reports healthy
+# as long as the process is up). start-period is sized for the measured cold boot (~110s on an
+# arm64 laptop): /health only answers after startup has injected the bundled adapters, which is
+# CPU-bound ONNX embedding on the local model. Kubernetes ignores this instruction —
+# SquadRules/charts owns pod probes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD ["node","-e","const t=(process.env.TRANSPORT_TYPE||'').trim().toLowerCase();if(t!=='http')process.exit(0);require('http').get({host:'127.0.0.1',port:Number(process.env.SERVER_PORT||3000),path:'/health',timeout:5000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))"]
 
@@ -175,6 +184,8 @@ LABEL org.opencontainers.image.title="SquadRules MCP" \
       org.opencontainers.image.revision="${BUILD_REVISION}" \
       org.opencontainers.image.base.name="docker.io/library/node:24-bookworm-slim"
 
-# `serve` (not `dist/index.js`) is the point: it is the entrypoint whose transport default
-# is stdio, which is what makes an environment-less container SIMPLE.
+# `serve` reads TRANSPORT_TYPE from the environment, so the baked http default makes an
+# environment-less container an HTTP server; `-e TRANSPORT_TYPE=stdio` switches it to the local
+# agent posture. serve spawns the server as a child rather than exec'ing it, so run with --init
+# (or shareProcessNamespace in Kubernetes) for SIGTERM forwarding.
 CMD ["node", "/app/node_modules/@squadrules/mcp/dist/cli/index.js", "serve"]

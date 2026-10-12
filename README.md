@@ -23,52 +23,54 @@ Both are multi-arch (`linux/amd64`, `linux/arm64`) and signed with
 
 ## Runtime modes
 
-The image bakes **no mode-selecting environment**. Its `CMD` is the `squadrules serve`
-entrypoint, whose transport default is `stdio`, so the container environment alone decides
-what the process becomes:
+The image defaults to the **HTTP server** posture: `TRANSPORT_TYPE=http` and `AUTH_ENABLED=false`
+are baked in, so an environment-less `docker run` boots a self-contained server with no external
+dependencies. Every setting is still an environment override, so the same image also covers a
+local stdio agent and a full authenticated cluster:
 
-| | SIMPLE (default) | CLUSTER |
-|---|---|---|
-| trigger | empty environment | any override, e.g. `TRANSPORT_TYPE=http` |
-| transport | stdio JSON-RPC on stdin/stdout | HTTP: UI, `/api`, `/mcp`, `/health`, metrics |
-| vector store | embedded LanceDB under `~/.config/squadrules/lancedb` | Qdrant (`QDRANT_URL`) |
-| key/value store | not used | Redis (`KEY_VALUE_STORE_URL`) |
-| auth | off (stdio is a local, single-user pipe) | Keycloak OIDC (`AUTH_ENABLED=true`) |
-| embeddings | local, key-free fastembed (weights baked in) | same, or `EMBEDDING_PROVIDER=openai` |
+| | default (zero env) | stdio (local agent) | full cluster |
+|---|---|---|---|
+| trigger | empty environment | `TRANSPORT_TYPE=stdio` | `AUTH_ENABLED=true` + external stores |
+| transport | HTTP: UI, `/api`, `/mcp`, `/health`, metrics | stdio JSON-RPC on stdin/stdout | HTTP |
+| vector store | embedded LanceDB under `~/.config/squadrules/lancedb` | embedded LanceDB | Qdrant (`QDRANT_URL`) |
+| key/value store | not used | not used | Redis (`KEY_VALUE_STORE_URL`) |
+| auth | off | off (stdio is a local, single-user pipe) | Keycloak OIDC |
+| embeddings | local, key-free fastembed (weights baked in) | same | same, or `EMBEDDING_PROVIDER=openai` |
+| reach it | publish `-p 3000:3000` | attach `-i` (opens no listener) | publish `-p 3000:3000` |
 
-**SIMPLE** — nothing to configure, and nothing to publish: a stdio server opens no listener.
-`-i` is required (MCP frames travel over stdin/stdout) and `--init` is recommended, because
-`squadrules serve` spawns the server as a child rather than `exec`ing it, so PID 1 would not
-forward `SIGTERM`:
-
-```sh
-docker run -i --rm --init docker.io/squadrules/mcp:latest
-```
-
-The mode guards are fail-fast, not silent: `QDRANT_URL` set while the transport resolves to
-`stdio` aborts startup ("`TRANSPORT_TYPE=stdio` is local simple mode and must use the embedded
-LanceDB store"), as does `AUTH_ENABLED=true` under stdio. An empty `QDRANT_URL` with
-`TRANSPORT_TYPE=http` is *not* a violation — that combination is what the CLUSTER smoke test
-above runs, and it selects the embedded store through the environment override.
-
-**CLUSTER** — every setting is an environment override. `TRANSPORT_TYPE=http` alone already
-gives a containerised server with the embedded vector store, which is enough for a single-pod
-install:
+**Default (zero env)** — a self-contained HTTP server on `:3000` backed by embedded LanceDB and
+the local fastembed model, auth off. `--init` is recommended because `squadrules serve` spawns the
+server as a child rather than `exec`ing it, so PID 1 would not forward `SIGTERM`:
 
 ```sh
 docker run -d --name squadrules-mcp --init \
   -p 127.0.0.1:3000:3000 \
-  -e TRANSPORT_TYPE=http \
-  -e AUTH_ENABLED=false \
   docker.io/squadrules/mcp:latest
+# → http://localhost:3000/health  (no configuration required)
 ```
 
-A full cluster deployment (Qdrant + Redis + Keycloak) with a read-only root filesystem:
+> The default is **unauthenticated** and binds `:3000`. That is deliberate for a standalone
+> single-container install (it matches the embedded store and baked model). Do not expose the port
+> publicly without either `-e AUTH_ENABLED=true` plus the OIDC variables below, or an
+> authenticating reverse proxy in front.
+
+**stdio (local agent)** — the single-user MCP server an agent host spawns. `-i` is required (MCP
+frames travel over stdin/stdout) and no listener is opened:
+
+```sh
+docker run -i --rm --init -e TRANSPORT_TYPE=stdio docker.io/squadrules/mcp:latest
+```
+
+The mode guards are fail-fast, not silent: `QDRANT_URL` set while the transport resolves to
+`stdio` aborts startup ("`TRANSPORT_TYPE=stdio` is local simple mode and must use the embedded
+LanceDB store"), as does `AUTH_ENABLED=true` under stdio.
+
+**Full cluster** — Qdrant + Redis + Keycloak with a read-only root filesystem. `TRANSPORT_TYPE` is
+already `http` by default, so it is omitted here (set it explicitly only to override):
 
 ```sh
 docker run -d --name squadrules-mcp --init \
   -p 127.0.0.1:3000:3000 -p 127.0.0.1:9090:9090 \
-  -e TRANSPORT_TYPE=http \
   -e QDRANT_URL=http://qdrant:6333 \
   -e QDRANT_COLLECTION=squadrules \
   -e KEY_VALUE_STORE_URL=redis://redis:6379 \
@@ -131,9 +133,10 @@ gate.
 3. `os-base` — the same pinned digest, `apt-get upgrade` and `libgomp1` (for the ONNX CPU
    provider) in one layer.
 4. `runtime` — `FROM os-base`, the installed `node_modules` and baked weights copied in, npm
-   deleted, two non-mode-affecting `ENV` values, the built-in `node` user (uid/gid **1000**,
-   which is what `SquadRules/charts` enforces with `runAsUser: 1000`), a mode-aware
-   `HEALTHCHECK`, OCI labels, and `CMD ["node","…/dist/cli/index.js","serve"]`.
+   deleted, `ENV` defaults that make a zero-env container an HTTP server (`TRANSPORT_TYPE=http`,
+   `AUTH_ENABLED=false`, plus `NODE_ENV` and `FASTEMBED_CACHE_DIR`), the built-in `node` user
+   (uid/gid **1000**, which is what `SquadRules/charts` enforces with `runAsUser: 1000`), a
+   mode-aware `HEALTHCHECK`, OCI labels, and `CMD ["node","…/dist/cli/index.js","serve"]`.
 
 `PACKAGE_VERSION` is a required build arg. The application content is fully determined by the
 published npm version, so the same version always produces the same node_modules tree.
@@ -169,11 +172,11 @@ pipeline. Triggers:
 Steps: resolve version → `docker buildx build` (multi-arch OCI, `--provenance=false
 --sbom=false` so the built digest can be re-pushed verbatim) → per-arch `skopeo` extract and
 `docker load` → [`scripts/ci-smoke-image.sh`](scripts/ci-smoke-image.sh) (package version,
-baked model present, **SIMPLE** MCP `initialize`/`tools/list` handshake over stdio with an
-empty environment, **CLUSTER** `TRANSPORT_TYPE=http` `/health` with the expected backend and a
-graceful `SIGTERM` stop) → Trivy `CRITICAL,HIGH` per arch (`.trivyignore`) → unfiltered SPDX
-SBOM per arch uploaded as a workflow artifact → `skopeo copy` to both registries →
-`cosign sign`/`verify` → promote aliases.
+baked model present, the **zero-env default** booting `TRANSPORT_TYPE=http` and serving
+`/health` with the embedded backend, a **`TRANSPORT_TYPE=stdio` override** answering an MCP
+`initialize`/`tools/list` handshake, and a graceful `SIGTERM` stop for each) → Trivy
+`CRITICAL,HIGH` per arch (`.trivyignore`) → unfiltered SPDX SBOM per arch uploaded as a
+workflow artifact → `skopeo copy` to both registries → `cosign sign`/`verify` → promote aliases.
 
 [`.github/workflows/security.yml`](.github/workflows/security.yml) — `.trivyignore` expiry
 guard, plus a Trivy scan of the `os-base` stage (`vuln-type: os`, CRITICAL,HIGH, `.trivyignore`)
@@ -217,7 +220,7 @@ project evolves; superseded ADRs are marked `deprecated` and linked forward.
 Current ADRs:
 
 - [0001](docs/adr/0001-node24-bookworm-slim-base.md) — Node 24 LTS on Debian bookworm-slim as the base image
-- [0002](docs/adr/0002-simple-by-default-runtime.md) — SIMPLE-by-default runtime contract
+- [0002](docs/adr/0002-http-by-default-runtime.md) — HTTP-by-default standalone runtime
 - [0003](docs/adr/0003-digest-pin-plus-upgrade-layer.md) — Digest pin plus apt-get upgrade layer and expiring-ignore risk register
 - [0004](docs/adr/0004-baked-embedding-model.md) — Baked ONNX embedding model
 - [0005](docs/adr/0005-npm-cli-removed-from-runtime.md) — npm CLI removed from the runtime image

@@ -15,7 +15,7 @@ The previous image was built on `node:22-alpine`. Two things changed at once:
    application repo pins.
 2. **The zero-config embedding path loads `onnxruntime-node`**, which ships
    glibc-only prebuilt binaries. Alpine's musl libc is therefore incompatible
-   with the embedding backend that SIMPLE mode depends on.
+   with the local embedding backend the image uses by default.
 
 The base image choice is load-bearing: it determines the libc available to
 native modules, the package manager used for OS CVE remediation, the attack
@@ -41,9 +41,9 @@ at the time of writing).
 ## Consequences
 
 - The image is larger than an Alpine-based one would be (roughly 1.5 GB with
-  the baked model vs ~400 MB Alpine could achieve). Accepted: the embedding
-  backend is non-negotiable for SIMPLE mode, and the image is pulled once per
-  node, not per request.
+  the baked model vs ~400 MB Alpine could achieve). Accepted: the local
+  embedding backend is non-negotiable for the default zero-config path, and the
+  image is pulled once per node, not per request.
 - OS CVE remediation now runs through `apt-get upgrade` in the `os-base`
   stage, not `apk upgrade`. See [ADR-0003](0003-digest-pin-plus-upgrade-layer.md).
 - `onnxruntime-node` also pulls in `libgomp1` (OpenMP), which the `os-base`

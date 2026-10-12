@@ -61,7 +61,7 @@ reproducible in practice.
   mcp ships the small-model default; ~209 MB while `latest` is 5.1.0 and
   still points at `bge-base-en-v1.5`). Accepted: see the size trade-off in
   [ADR-0001](0001-node24-bookworm-slim-base.md).
-- A CLUSTER boot on a read-only root filesystem, or an air-gapped node, needs
+- A boot on a read-only root filesystem, or an air-gapped node, needs
   no Hugging Face egress and pays no first-request download latency.
 - The CI smoke test asserts the baked model directory exists
   (`scripts/ci-smoke-image.sh` step 2), so a regression in the bake is loud.
@@ -70,5 +70,6 @@ reproducible in practice.
   is the hard gate that catches a bake regression before publication.
 - The `@anush008/tokenizers ^0.6.0` override in the `deps` stage is
   architectural, not security-driven: fastembed's `"^0.0.0"` resolves to
-  0.0.0, whose universal stub ships no linux-arm64 binary, so SIMPLE mode
-  cannot work on arm64 without the bump. Fix at source in `SquadRules/mcp`.
+  0.0.0, whose universal stub ships no linux-arm64 binary, so the local
+  embedding path cannot work on arm64 without the bump. Fix at source in
+  `SquadRules/mcp`.
