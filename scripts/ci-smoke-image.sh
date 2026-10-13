@@ -16,8 +16,9 @@
 # Usage: ci-smoke-image.sh <image-ref> <expected-package-version> [--platform <platform>]
 #
 # The deadline defaults to 600s because startup embeds the bundled adapters with a local ONNX
-# model; under QEMU (the arm64 leg of an x86 CI runner) that is several times slower than
-# native. Override with SMOKE_CLUSTER_DEADLINE.
+# model; under QEMU (the arm64 leg of an x86 CI runner) that is roughly an order of magnitude
+# slower than native and overruns 600s, so the pipeline raises SMOKE_CLUSTER_DEADLINE for the
+# arm64 leg. Override it here for any other slow host.
 set -euo pipefail
 
 usage() {

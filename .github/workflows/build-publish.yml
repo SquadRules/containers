@@ -149,6 +149,18 @@ jobs:
             # zero-env default (baked TRANSPORT_TYPE=http) boots and serves /health with the
             # embedded LanceDB backend, which also loads the per-arch native modules and the
             # baked embedding model. It is torn down by SIGTERM.
+            #
+            # /health only answers after startup embeds the bundled adapters with the local
+            # ONNX model. That is CPU-bound inference: seconds natively, but the arm64 leg
+            # runs it under QEMU emulation on this x86 runner, which is roughly an order of
+            # magnitude slower and overruns the script's 600s default. Give the emulated leg
+            # a deadline sized for QEMU (the 90 min job timeout still bounds it); amd64 keeps
+            # the tight default so a genuinely hung native boot still fails fast.
+            if [ "${arch}" = "arm64" ]; then
+              export SMOKE_CLUSTER_DEADLINE=2700
+            else
+              export SMOKE_CLUSTER_DEADLINE=600
+            fi
             ./scripts/ci-smoke-image.sh "squadrules-scan:${arch}" "${VERSION}" \
               --platform "linux/${arch}"
           done
