@@ -6,7 +6,7 @@
 # node_modules leaves the image, so this is a pure packaging of an already-published,
 # already-released version.
 #
-# Runtime modes — the container defaults to the HTTP server posture:
+# Runtime modes — the container is an HTTP server:
 #
 #   * Default (zero env): TRANSPORT_TYPE=http and AUTH_ENABLED=false are baked in, so an
 #     environment-less `docker run` boots a self-contained HTTP server on :3000 (UI, /api,
@@ -15,8 +15,6 @@
 #     container CMD keeps the historical `http` default (see resolveTransportType);
 #     AUTH_ENABLED is pinned off because under http it would otherwise default to on and
 #     refuse to boot without Keycloak. Publish the port (`-p 3000:3000`) to reach it.
-#   * stdio (local agent): override with `-e TRANSPORT_TYPE=stdio` for the single-user MCP
-#     server an agent host spawns — JSON-RPC on stdin/stdout (`docker run -i`), no listener.
 #   * Full cluster: add `-e AUTH_ENABLED=true` plus QDRANT_URL / KEY_VALUE_STORE_URL /
 #     KEYCLOAK_* to move to external stores and turn on OIDC. Every setting stays
 #     env-overridable, and `docker exec`-style probes and Helm/Kubernetes liveness apply.
@@ -136,10 +134,9 @@ RUN set -eux; \
     test ! -e /usr/local/bin/npm; \
     du -sh "${MODEL_CACHE_DIR}"
 
-# Documentation only — EXPOSE carries no enforcement. With the http default the server
-# listens on 3000 (metrics on 9090); both mirror the app defaults (SERVER_PORT 3000,
-# METRICS_PORT 9090) and are overridable by environment. Under a TRANSPORT_TYPE=stdio
-# override no listener is opened and these ports are unused.
+# Documentation only — EXPOSE carries no enforcement. The server listens on 3000 (metrics on
+# 9090); both mirror the app defaults (SERVER_PORT 3000, METRICS_PORT 9090) and are overridable
+# by environment.
 EXPOSE 3000 9090
 
 # NODE_ENV is the usual production switch and FASTEMBED_CACHE_DIR points at the baked weights
@@ -147,8 +144,8 @@ EXPOSE 3000 9090
 # cannot shadow them). TRANSPORT_TYPE=http and AUTH_ENABLED=false make the zero-env default a
 # self-contained HTTP server: http is the app's container-CMD default, and AUTH_ENABLED is
 # pinned off because under http it would otherwise default to on and refuse to boot without
-# Keycloak. All four are overridable at `docker run` — e.g. `-e TRANSPORT_TYPE=stdio` for the
-# local agent posture, or `-e AUTH_ENABLED=true` plus the OIDC vars for a full cluster.
+# Keycloak. All are overridable at `docker run` — e.g. `-e AUTH_ENABLED=true` plus the OIDC
+# vars for a full cluster.
 ENV NODE_ENV=production \
     FASTEMBED_CACHE_DIR=${MODEL_CACHE_DIR} \
     TRANSPORT_TYPE=http \
@@ -158,14 +155,12 @@ ENV NODE_ENV=production \
 # runAsUser: 1000 that the SquadRules/charts pod securityContext already enforces.
 USER node
 
-# Mode-aware healthcheck. The http default means this probes /health out of the box; under a
-# TRANSPORT_TYPE=stdio override there is no socket, so the check no-ops (Docker reports healthy
-# as long as the process is up). start-period is sized for the measured cold boot (~110s on an
-# arm64 laptop): /health only answers after startup has injected the bundled adapters, which is
-# CPU-bound ONNX embedding on the local model. Kubernetes ignores this instruction —
-# SquadRules/charts owns pod probes.
+# Healthcheck. The image is an HTTP server, so this always probes /health. start-period is
+# sized for the measured cold boot (~110s on an arm64 laptop): /health only answers after
+# startup has injected the bundled adapters, which is CPU-bound ONNX embedding on the local
+# model. Kubernetes ignores this instruction — SquadRules/charts owns pod probes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
-    CMD ["node","-e","const t=(process.env.TRANSPORT_TYPE||'').trim().toLowerCase();if(t!=='http')process.exit(0);require('http').get({host:'127.0.0.1',port:Number(process.env.SERVER_PORT||3000),path:'/health',timeout:5000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))"]
+    CMD ["node","-e","require('http').get({host:'127.0.0.1',port:Number(process.env.SERVER_PORT||3000),path:'/health',timeout:5000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))"]
 
 # OCI base-image annotations. The pipeline supplies the values it knows only at build time as
 # build args (BUILD_REVISION / BUILD_SOURCE) rather than `--label`, so `docker inspect` of a
@@ -185,7 +180,7 @@ LABEL org.opencontainers.image.title="SquadRules MCP" \
       org.opencontainers.image.base.name="docker.io/library/node:24-bookworm-slim"
 
 # `serve` reads TRANSPORT_TYPE from the environment, so the baked http default makes an
-# environment-less container an HTTP server; `-e TRANSPORT_TYPE=stdio` switches it to the local
-# agent posture. serve spawns the server as a child rather than exec'ing it, so run with --init
-# (or shareProcessNamespace in Kubernetes) for SIGTERM forwarding.
+# environment-less container an HTTP server. serve spawns the server as a child rather than
+# exec'ing it, so run with --init (or shareProcessNamespace in Kubernetes) for SIGTERM
+# forwarding.
 CMD ["node", "/app/node_modules/@squadrules/mcp/dist/cli/index.js", "serve"]

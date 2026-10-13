@@ -40,22 +40,19 @@ ENV TRANSPORT_TYPE=http \
 with `CMD ["node", ".../dist/cli/index.js", "serve"]`. `serve` reads
 `TRANSPORT_TYPE` from the environment, so the baked value makes an
 environment-less container an HTTP server; `AUTH_ENABLED=false` keeps it
-self-contained. The result is three postures, all reachable from the same image
-by environment override:
+self-contained. The result is two postures, both HTTP, reachable from the same
+image by environment override:
 
 - **Default (zero env):** a self-contained HTTP server on `:3000` (UI, `/api`,
   `/mcp`, `/health`, metrics) backed by embedded LanceDB and the local key-free
   fastembed model, with no external dependencies and no auth.
   `docker run -p 3000:3000 squadrules/mcp:<version>`.
-- **stdio (local agent):** `-e TRANSPORT_TYPE=stdio` gives the single-user MCP
-  server an agent host spawns — JSON-RPC on stdin/stdout (`docker run -i`), no
-  listener.
 - **Full cluster:** add `-e AUTH_ENABLED=true` plus `QDRANT_URL` /
   `KEY_VALUE_STORE_URL` / `KEYCLOAK_*` to move to external stores and OIDC.
 
-The stdio guards still apply under the override: `TRANSPORT_TYPE=stdio` with a
-set `QDRANT_URL`, or with `AUTH_ENABLED=true`, aborts startup
-(`getStdioConfigViolations`).
+The container is HTTP-only: a stdio transport is not offered as a posture. An
+agent host that wants a local, single-user MCP server runs the
+`@squadrules/mcp` CLI/npm package directly on its own machine, not this image.
 
 ## Consequences
 
@@ -67,8 +64,8 @@ set `QDRANT_URL`, or with `AUTH_ENABLED=true`, aborts startup
   production cluster config: operators exposing the port publicly must set
   `AUTH_ENABLED=true` and the OIDC vars, or front it with an authenticating
   proxy. Documented in the README.
-- The healthcheck now probes `/health` by default (see
-  [ADR-0006](0006-mode-aware-healthcheck.md)) instead of no-oping.
+- The healthcheck always probes `/health` (see
+  [ADR-0006](0006-http-healthcheck.md)).
 - `serve` still spawns the server as a child rather than `exec`-ing it, so PID 1
   does not forward SIGTERM; run with `--init` (or `shareProcessNamespace` in
   Kubernetes).

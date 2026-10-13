@@ -105,9 +105,9 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # The per-arch smoke boots a real server twice, once of them under QEMU, and startup is
-    # CPU-bound ONNX embedding work — the 45 min that was enough for a `serve --help` assert
-    # is not enough for an emulated cold boot.
+    # The per-arch smoke boots a real HTTP server (under QEMU on the arm64 leg of an x86
+    # runner), and startup is CPU-bound ONNX embedding work — the 45 min that was enough for a
+    # `serve --help` assert is not enough for an emulated cold boot.
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -137,7 +137,7 @@ jobs:
             --output type=oci,dest=.local/image.oci.tar \
             -f mcp/Dockerfile mcp
 
-      - name: Smoke-test both platforms (version, baked model, default HTTP, stdio override)
+      - name: Smoke-test both platforms (version, baked model, default HTTP)
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
@@ -145,11 +145,10 @@ jobs:
               oci-archive:.local/image.oci.tar \
               "docker-archive:.local/scan-${arch}.tar:squadrules-scan:${arch}"
             docker load --input ".local/scan-${arch}.tar"
-            # scripts/ci-smoke-image.sh proves the two runtime postures on this architecture:
-            # the zero-env default (baked TRANSPORT_TYPE=http) boots and serves /health with the
-            # embedded LanceDB backend, and a TRANSPORT_TYPE=stdio override answers an MCP
-            # initialize/tools/list handshake (loading the per-arch native modules and the baked
-            # embedding model). Both are torn down by SIGTERM.
+            # scripts/ci-smoke-image.sh proves the HTTP server on this architecture: the
+            # zero-env default (baked TRANSPORT_TYPE=http) boots and serves /health with the
+            # embedded LanceDB backend, which also loads the per-arch native modules and the
+            # baked embedding model. It is torn down by SIGTERM.
             ./scripts/ci-smoke-image.sh "squadrules-scan:${arch}" "${VERSION}" \
               --platform "linux/${arch}"
           done
