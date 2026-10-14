@@ -292,6 +292,11 @@ jobs:
           # release with missing SBOMs.
           if-no-files-found: error
           retention-days: 90
+          # upload-artifact@v5 defaults include-hidden-files to false, which silently
+          # drops anything under a dot-directory. SBOMs live in .local/, so without
+          # this flag the glob matches nothing and if-no-files-found: error fails the
+          # build even though the files are on disk.
+          include-hidden-files: true
           path: .local/sbom-*.spdx.json
 
       - name: Persist digest for the publish job
@@ -306,6 +311,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+          # Same dot-directory trap as the SBOM upload: .local/image.oci.tar and
+          # .local/digest.txt are invisible to upload-artifact@v5 unless hidden
+          # files are explicitly included.
+          include-hidden-files: true
           path: |
             .local/image.oci.tar
             .local/digest.txt
