@@ -301,35 +301,30 @@ jobs:
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: |
-          set -euo pipefail
+          # Deliberately NOT `set -e` (and `set +e` cancels the errexit that GitHub's
+          # default bash invocation adds): every command failure is handled explicitly so
+          # that one registry cannot strand the other. Previously a single sequential loop
+          # aborted the whole step on the first push failure, which left docker.io holding
+          # the version tag with NO cosign signature and NO alias tags whenever quay.io
+          # failed. Each registry is now an independent atomic publish, and the step still
+          # exits non-zero at the end if any registry failed (branch protection preserved).
+          set +e
+          set -uo pipefail
           digest="$(cat .local/digest.txt)"
           authfile="${HOME}/.docker/config.json"
           targets="docker.io/squadrules/mcp ${QUAY_IMAGE}"
 
-          # 1) Push the immutable version tag to every registry (preserve the built digest).
-          for target in ${targets}; do
-            if ! skopeo copy --all --preserve-digests --authfile "${authfile}" \
-              oci-archive:.local/image.oci.tar "docker://${target}:${VERSION}"; then
-              case "${target}" in
-                quay.io/*)
-                  echo "::error::quay.io push failed — verify robot token has write permission on ${QUAY_NAMESPACE}/mcp"
-                  ;;
-              esac
-              exit 1
-            fi
-          done
+          # 0) Pre-flight probe. A quay.io robot token fails late and opaquely — a missing
+          #    repository and a missing permission are indistinguishable from a push error.
+          #    Warn before the loop so the failure is diagnosable; never abort here, because
+          #    docker.io must still publish even when quay.io is unreachable.
+          if ! curl -sf -u "${QUAY_USERNAME}:${QUAY_PASSWORD}" \
+               "https://quay.io/v2/${QUAY_NAMESPACE}/mcp/tags/list" >/dev/null 2>&1; then
+            echo "::warning::quay.io/${QUAY_NAMESPACE}/mcp is not reachable with robot credentials — ensure the repository exists and the robot has Read+Write permission"
+          fi
 
-          # 2) Cosign keyless sign + verify each published digest.
-          for target in ${targets}; do
-            cosign sign --yes "${target}@${digest}"
-            cosign verify \
-              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "${target}@${digest}"
-          done
-
-          # 3) Derive channel aliases (mirrors the application repo's channelTags()):
-          #    stable X.Y.Z -> latest, X, X.Y ; prerelease X.Y.Z-<channel>.N -> <channel>.
+          # Derive channel aliases (mirrors the application repo's channelTags()):
+          #   stable X.Y.Z -> latest, X, X.Y ; prerelease X.Y.Z-<channel>.N -> <channel>.
           case "${VERSION}" in
             *-*)
               channel="$(printf '%s' "${VERSION}" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+-([a-z0-9-]+)\.[0-9]+$/\1/')"
@@ -340,15 +335,66 @@ jobs:
               tags="latest ${major} ${major}.${minor}"
               ;;
           esac
-          echo "Promoting aliases: ${tags}"
 
-          # 4) Promote aliases by copying the immutable digest to each tag (idempotent).
-          for target in ${targets}; do
+          # Publish ONE registry end-to-end: push the immutable version tag (preserving the
+          # built digest), sign and verify that digest, then promote the channel aliases.
+          # Returns 0 only when the whole sequence succeeded for this target.
+          publish_one() {
+            local target="$1"
+            local tag
+
+            if ! skopeo copy --all --preserve-digests --authfile "${authfile}" \
+              oci-archive:.local/image.oci.tar "docker://${target}:${VERSION}"; then
+              echo "::error::Publish FAILED for ${target}:${VERSION} — immutable tag push did not complete"
+              case "${target}" in
+                quay.io/*)
+                  echo "::error::quay.io push failed — verify robot token has write permission on ${QUAY_NAMESPACE}/mcp"
+                  ;;
+              esac
+              return 1
+            fi
+
+            if ! cosign sign --yes "${target}@${digest}"; then
+              echo "::error::Publish FAILED for ${target}@${digest} — cosign sign did not complete"
+              return 1
+            fi
+
+            if ! cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${target}@${digest}"; then
+              echo "::error::Publish FAILED for ${target}@${digest} — cosign verify rejected the signature"
+              return 1
+            fi
+
+            # Promote aliases by copying the immutable digest to each tag (idempotent).
             for tag in ${tags}; do
-              skopeo copy --all --preserve-digests --authfile "${authfile}" \
-                "docker://${target}@${digest}" "docker://${target}:${tag}"
+              if ! skopeo copy --all --preserve-digests --authfile "${authfile}" \
+                "docker://${target}@${digest}" "docker://${target}:${tag}"; then
+                echo "::error::Publish FAILED for ${target}:${tag} — alias promotion did not complete"
+                return 1
+              fi
             done
+
+            echo "Published ${target}:${VERSION} (${digest}) signed, aliases: ${tags}"
+            return 0
+          }
+
+          # 1) Publish each registry independently, recording — not aborting on — failure.
+          failed_targets=""
+          for target in ${targets}; do
+            if publish_one "${target}"; then
+              echo "::notice::Publish succeeded for ${target}:${VERSION} (signed, aliases promoted)"
+            else
+              failed_targets="${failed_targets} ${target}"
+            fi
           done
+
+          if [ -n "${failed_targets}" ]; then
+            echo "::error::Publish incomplete for:${failed_targets} — the remaining registries were still attempted"
+            exit 1
+          fi
+
           echo "${digest}" > .local/published-digest.txt
 
       - name: Verify published tags resolve in both registries
