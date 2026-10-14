@@ -1,11 +1,16 @@
 # Security scans for the container image repository.
 #
 #   - trivyignore-expiry    : guard that .trivyignore exp:YYYY-MM-DD entries are valid/unexpired.
-#   - container-base-os-trivy: Trivy scans the Alpine OS layer only (vuln-type=os), using the same
-#                             FROM ref + apk upgrade line as mcp/Dockerfile, and auto-remediates by
-#                             bumping the pinned base digest (PR flow: commit to the PR branch;
-#                             schedule/push flow: open an auto-merge PR). Scanning the raw digest
-#                             alone would miss the apk-upgrade layer.
+#   - container-base-os-trivy: Trivy scans the `os-base` stage of mcp/Dockerfile — the pinned
+#                             Debian digest plus the apt upgrade layer, i.e. the operating system
+#                             the image actually ships (vuln-type=os, CRITICAL,HIGH, .trivyignore)
+#                             — and auto-remediates by bumping the pinned base digest (PR flow:
+#                             commit to the PR branch; schedule/push flow: open an auto-merge PR).
+#
+# The stage is built from the real Dockerfile (`--target os-base`) rather than re-assembled from
+# grepped lines, so this job cannot drift from what ships and only pays for the apt layer (the
+# npm install and model bake stages are not part of the target). A digest bump is what pulls in a
+# newer Node patch release from upstream; Debian package fixes come from the upgrade layer.
 #
 # The authoritative full image+library scan (CRITICAL,HIGH) runs in build-publish.yml against the
 # actually-published artifact; this workflow shifts the base-OS fix left so that gate stays green.
@@ -65,21 +70,20 @@ jobs:
       - name: Base image ref from Dockerfile
         id: base
         run: |
-          line=$(grep -m1 '^FROM ' mcp/Dockerfile)
+          line=$(grep -m1 ' AS os-base$' mcp/Dockerfile)
           ref="${line#FROM }"
           ref="${ref%% AS *}"
-          echo "image_ref=$(echo "$ref" | xargs)" >> "$GITHUB_OUTPUT"
+          ref=$(echo "$ref" | xargs)
           img="${ref%%@*}"
           digest="${ref##*@}"
           echo "image_name=$img" >> "$GITHUB_OUTPUT"
           echo "current_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pinned base: $img @ $digest"
 
-      - name: One-layer image (FROM + apk upgrade RUN from Dockerfile)
+      - name: Build the OS layer the image ships (os-base only)
         run: |
-          img="${{ steps.base.outputs.image_ref }}"
-          run_cmd=$(grep -E '^RUN apk update && apk upgrade --no-cache$' mcp/Dockerfile | sed 's/^RUN //' | head -1)
-          if [ -z "$run_cmd" ]; then echo "::error::Expected \"RUN apk update && apk upgrade --no-cache\" line in mcp/Dockerfile"; exit 1; fi
-          printf 'FROM %s\nRUN %s\n' "$img" "$run_cmd" | docker build -t squadrules-os:ci -
+          set -euo pipefail
+          docker buildx build --target os-base -t squadrules-os:ci -f mcp/Dockerfile mcp
 
       - name: Trivy scan (attempt)
         id: trivy-scan
@@ -91,6 +95,7 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           vuln-type: os
+          trivyignores: .trivyignore
 
       - name: Auto-remediate base image
         if: steps.trivy-scan.outcome == 'failure'
@@ -101,8 +106,15 @@ jobs:
 
           echo "::warning::Trivy found vulnerabilities, attempting base image update..."
 
-          docker pull "$img_name" --quiet
-          new_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$img_name" | sed 's/.*@//')
+          # The manifest-INDEX digest, never a per-platform manifest digest: buildx resolves
+          # the tag in the registry, so the value written into the Dockerfile keeps working on
+          # every architecture the pipeline builds. `docker inspect .RepoDigests` would give the
+          # single-platform digest of whatever the runner happens to pull.
+          new_digest=$(docker buildx imagetools inspect "$img_name" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"' | xargs)
+          if ! printf '%s' "$new_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Resolved base digest '$new_digest' is not a sha256 manifest digest"; exit 1
+          fi
           old_digest="${{ steps.base.outputs.current_digest }}"
 
           if [ "$new_digest" = "$old_digest" ]; then
@@ -113,8 +125,7 @@ jobs:
           echo "Updating mcp/Dockerfile: $old_digest -> $new_digest"
           sed -i "s|$old_digest|$new_digest|g" mcp/Dockerfile
 
-          run_cmd=$(grep -E '^RUN apk update && apk upgrade --no-cache$' mcp/Dockerfile | sed 's/^RUN //' | head -1)
-          printf 'FROM %s\nRUN %s\n' "$img_name@$new_digest" "$run_cmd" | docker build -t squadrules-os:ci -
+          docker buildx build --target os-base -t squadrules-os:ci -f mcp/Dockerfile mcp
 
           echo "new_digest=$new_digest" >> "$GITHUB_OUTPUT"
 
@@ -127,6 +138,7 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           vuln-type: os
+          trivyignores: .trivyignore
 
       - name: Commit base image update
         if: steps.trivy-scan.outcome == 'failure' && success()
