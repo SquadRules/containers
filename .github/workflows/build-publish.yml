@@ -43,8 +43,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: container-image-pipeline
-  cancel-in-progress: false
+  group: container-image-pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PACKAGE: '@squadrules/mcp'
