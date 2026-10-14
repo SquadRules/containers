@@ -226,31 +226,70 @@ jobs:
       # with the image, and the pipeline's whole point is publishing the built digest.
       # Unfiltered (no severity limit, no .trivyignore, every package whether or not it has a
       # CVE) — an SBOM is an inventory, and a suppressed finding must stay visible in it.
+      #
+      # Why direct trivy CLI instead of trivy-action for the SBOM steps? trivy-action@v0.36.0
+      # is a composite action that plumbs its `input:` / `output:` / `format:` inputs into
+      # trivy by writing them to a `./trivy_envs.txt` shell-sourced file and then invoking
+      # `trivy image <scan-ref-defaults-to-dot>`. For tarball scans the wrapper's env-file
+      # indirection has proven unreliable: the step exits 0 but `TRIVY_OUTPUT` never reaches
+      # the child trivy process, so no file lands in `.local/` and the `Upload SBOMs` glob
+      # matches nothing. Calling trivy directly with explicit `--input` and `--output` paths
+      # removes the indirection, and the `test -s` post-check turns a silent no-op into a
+      # loud `::error::` in the same step.
       - name: Ensure .local/ exists for SBOM output
         run: mkdir -p .local
 
-      - name: Generate SPDX SBOM (amd64)
-        uses: aquasecurity/trivy-action@v0.36.0
+      - name: Install Trivy for direct SBOM generation
+        # Same pin trivy-action@v0.36.0 uses internally, so this is a no-op when the
+        # preceding trivy-action steps have already installed trivy, and an explicit
+        # install when they haven't — the SBOM steps never depend on step ordering.
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
         with:
-          input: .local/scan-amd64.tar
-          scanners: vuln
-          format: spdx-json
-          output: .local/sbom-amd64.spdx.json
-          list-all-pkgs: 'true'
+          version: v0.70.0
+          cache: 'true'
+
+      - name: Generate SPDX SBOM (amd64)
+        env:
+          TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+        run: |
+          set -euo pipefail
+          command -v trivy >/dev/null || { echo "::error::trivy is not on PATH"; exit 1; }
+          out="${GITHUB_WORKSPACE}/.local/sbom-amd64.spdx.json"
+          rm -f "${out}"
+          trivy image \
+            --input "${GITHUB_WORKSPACE}/.local/scan-amd64.tar" \
+            --scanners vuln \
+            --format spdx-json \
+            --list-all-pkgs \
+            --output "${out}"
+          test -s "${out}" || { echo "::error::SBOM (amd64) was not written to ${out}"; exit 1; }
+          echo "amd64 SBOM: $(wc -c < "${out}") bytes -> ${out}"
 
       - name: Generate SPDX SBOM (arm64)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          input: .local/scan-arm64.tar
-          scanners: vuln
-          format: spdx-json
-          output: .local/sbom-arm64.spdx.json
-          list-all-pkgs: 'true'
+        env:
+          TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+        run: |
+          set -euo pipefail
+          command -v trivy >/dev/null || { echo "::error::trivy is not on PATH"; exit 1; }
+          out="${GITHUB_WORKSPACE}/.local/sbom-arm64.spdx.json"
+          rm -f "${out}"
+          trivy image \
+            --input "${GITHUB_WORKSPACE}/.local/scan-arm64.tar" \
+            --scanners vuln \
+            --format spdx-json \
+            --list-all-pkgs \
+            --output "${out}"
+          test -s "${out}" || { echo "::error::SBOM (arm64) was not written to ${out}"; exit 1; }
+          echo "arm64 SBOM: $(wc -c < "${out}") bytes -> ${out}"
 
       - name: Upload SBOMs
         uses: actions/upload-artifact@v5
         with:
           name: sbom-${{ needs.resolve.outputs.version }}
+          # Kept at `error`: the preceding steps now verify the artifacts exist on disk
+          # with `test -s`, so an empty glob here means the verification was bypassed,
+          # not that trivy silently no-op'd. Fail loudly rather than publish a
+          # release with missing SBOMs.
           if-no-files-found: error
           retention-days: 90
           path: .local/sbom-*.spdx.json
