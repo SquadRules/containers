@@ -226,6 +226,9 @@ jobs:
       # with the image, and the pipeline's whole point is publishing the built digest.
       # Unfiltered (no severity limit, no .trivyignore, every package whether or not it has a
       # CVE) — an SBOM is an inventory, and a suppressed finding must stay visible in it.
+      - name: Ensure .local/ exists for SBOM output
+        run: mkdir -p .local
+
       - name: Generate SPDX SBOM (amd64)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
