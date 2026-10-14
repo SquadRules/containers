@@ -13,12 +13,21 @@
 #      fastembed/onnxruntime modules load on this architecture (npm optional platform deps are
 #      per-arch): startup embeds the bundled adapters before /health answers.
 #
+# SMOKE_SKIP_HEALTH=1 replaces leg 3 with a lighter native-module load check: it requires
+# onnxruntime-node and @lancedb/lancedb inside the image and asserts they resolve and print
+# their arch. That is the actual packaging risk the smoke guards against (per-arch optional
+# deps must ship a working binary for the target platform) and it finishes in seconds even
+# under QEMU. Use it on the arm64 leg of an x86 CI runner, where booting the full server
+# would spend 45+ min on CPU-bound ONNX inference emulating the boot-injection of every
+# bundled adapter before /health ever answers. amd64 keeps the full HTTP boot.
+#
 # Usage: ci-smoke-image.sh <image-ref> <expected-package-version> [--platform <platform>]
 #
 # The deadline defaults to 600s because startup embeds the bundled adapters with a local ONNX
 # model; under QEMU (the arm64 leg of an x86 CI runner) that is roughly an order of magnitude
-# slower than native and overruns 600s, so the pipeline raises SMOKE_CLUSTER_DEADLINE for the
-# arm64 leg. Override it here for any other slow host.
+# slower than native and overruns 600s. Rather than raise SMOKE_CLUSTER_DEADLINE for the
+# emulated leg, the pipeline sets SMOKE_SKIP_HEALTH=1 there so leg 3 does the native module
+# check and the 600s default stays meaningful on every architecture.
 set -euo pipefail
 
 usage() {
@@ -123,53 +132,72 @@ if [ -z "$model_dir" ]; then
 fi
 echo "ok: ${model_dir}"
 
-say "3) default (zero env): HTTP transport boots, serves /health, stops on signal"
-# No -e flags: this leg proves the image's baked default (TRANSPORT_TYPE=http, AUTH_ENABLED=false)
-# boots a reachable, self-contained server on an empty environment. Reaching /health 200 with no
-# Keycloak vars at all is also the proof that auth is off by default (auth-on would fail startup).
-cluster_cid="$(docker run -d --init "${RUN_ARGS[@]}" --name "squadrules-smoke-default-${RANDOM}" \
-    -p 127.0.0.1::3000 \
-    "$IMAGE")"
-CONTAINERS+=("$cluster_cid")
-host_port="$(docker port "$cluster_cid" 3000/tcp | head -1 | sed 's/.*://')"
+if [ "${SMOKE_SKIP_HEALTH:-0}" = "1" ]; then
+    say "3) native modules load on ${PLATFORM} (SMOKE_SKIP_HEALTH=1: /health boot skipped)"
+    # Packaging-risk-only check: require() the per-arch native deps inside the image and let
+    # Node's resolver walk node_modules. A MODULE_NOT_FOUND, an ABI mismatch, or a missing
+    # arm64 prebuild surfaces as a non-zero exit here. Booting the full HTTP server under
+    # QEMU would prove the same thing but spend 45+ min on ONNX inference first.
+    docker run --rm "${RUN_ARGS[@]}" --entrypoint node "$IMAGE" -e '
+      const ort = require("onnxruntime-node");
+      require("@lancedb/lancedb");
+      const ortVersion = (ort && ort.env && ort.env.versions && ort.env.versions.ort) || "loaded";
+      console.log("onnxruntime-node: " + ortVersion);
+      console.log("@lancedb/lancedb: loaded");
+      console.log("Native modules OK on " + process.arch);
+    ' || {
+        echo "::error::native module load check failed on ${PLATFORM}" >&2
+        exit 1
+    }
+else
+    say "3) default (zero env): HTTP transport boots, serves /health, stops on signal"
+    # No -e flags: this leg proves the image's baked default (TRANSPORT_TYPE=http, AUTH_ENABLED=false)
+    # boots a reachable, self-contained server on an empty environment. Reaching /health 200 with no
+    # Keycloak vars at all is also the proof that auth is off by default (auth-on would fail startup).
+    cluster_cid="$(docker run -d --init "${RUN_ARGS[@]}" --name "squadrules-smoke-default-${RANDOM}" \
+        -p 127.0.0.1::3000 \
+        "$IMAGE")"
+    CONTAINERS+=("$cluster_cid")
+    host_port="$(docker port "$cluster_cid" 3000/tcp | head -1 | sed 's/.*://')"
 
-health=""
-deadline=$((SECONDS + ${SMOKE_CLUSTER_DEADLINE:-600}))
-while [ "$SECONDS" -lt "$deadline" ]; do
-    health="$(curl -fsS --max-time 5 "http://127.0.0.1:${host_port}/health" 2>/dev/null || true)"
-    [ -n "$health" ] && break
-    if ! docker inspect -f '{{.State.Running}}' "$cluster_cid" | grep -q true; then
-        echo "::error::default-mode container exited before serving /health" >&2
+    health=""
+    deadline=$((SECONDS + ${SMOKE_CLUSTER_DEADLINE:-600}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        health="$(curl -fsS --max-time 5 "http://127.0.0.1:${host_port}/health" 2>/dev/null || true)"
+        [ -n "$health" ] && break
+        if ! docker inspect -f '{{.State.Running}}' "$cluster_cid" | grep -q true; then
+            echo "::error::default-mode container exited before serving /health" >&2
+            docker logs --tail 40 "$cluster_cid" >&2 || true
+            exit 1
+        fi
+        sleep 5
+    done
+    if [ -z "$health" ]; then
+        echo "::error::/health never answered on 127.0.0.1:${host_port}" >&2
         docker logs --tail 40 "$cluster_cid" >&2 || true
         exit 1
     fi
-    sleep 5
-done
-if [ -z "$health" ]; then
-    echo "::error::/health never answered on 127.0.0.1:${host_port}" >&2
-    docker logs --tail 40 "$cluster_cid" >&2 || true
-    exit 1
-fi
-printf '%s' "$health" | node -e '
-let raw = "";
-process.stdin.on("data", (c) => (raw += c));
-process.stdin.on("end", () => {
-  const h = JSON.parse(raw);
-  const problems = [];
-  if (h.status !== "healthy") problems.push("status=" + h.status);
-  if (h.transport !== "http") problems.push("transport=" + h.transport);
-  const backend = (h.details || {}).vectorStoreBackend || "";
-  // With no QDRANT_URL the baked http default selects the embedded store; that is the contract.
-  if (backend !== "embedded-lancedb") problems.push("vectorStoreBackend=" + backend);
-  if (problems.length) { console.error(problems.join(", ")); process.exit(1); }
-  console.log("ok: /healthy over http, backend=" + backend);
-});
-' || {
-    echo "::error::unexpected /health payload: $health" >&2
-    exit 1
-}
+    printf '%s' "$health" | node -e '
+    let raw = "";
+    process.stdin.on("data", (c) => (raw += c));
+    process.stdin.on("end", () => {
+      const h = JSON.parse(raw);
+      const problems = [];
+      if (h.status !== "healthy") problems.push("status=" + h.status);
+      if (h.transport !== "http") problems.push("transport=" + h.transport);
+      const backend = (h.details || {}).vectorStoreBackend || "";
+      // With no QDRANT_URL the baked http default selects the embedded store; that is the contract.
+      if (backend !== "embedded-lancedb") problems.push("vectorStoreBackend=" + backend);
+      if (problems.length) { console.error(problems.join(", ")); process.exit(1); }
+      console.log("ok: /healthy over http, backend=" + backend);
+    });
+    ' || {
+        echo "::error::unexpected /health payload: $health" >&2
+        exit 1
+    }
 
-# Graceful shutdown (see stop_measured).
-stop_measured "$cluster_cid" default || exit 1
+    # Graceful shutdown (see stop_measured).
+    stop_measured "$cluster_cid" default || exit 1
+fi
 
 say "smoke passed for ${IMAGE}${PLATFORM:+ (${PLATFORM})}"

@@ -115,10 +115,12 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # The per-arch smoke boots a real HTTP server (under QEMU on the arm64 leg of an x86
-    # runner), and startup is CPU-bound ONNX embedding work — boot-injecting the 11 bundled
-    # adapters under emulation runs 45+ min, so the job budget is sized well beyond that.
-    timeout-minutes: 120
+    # The amd64 leg boots the full HTTP server and asserts /health (~40s natively). The
+    # arm64 leg runs under QEMU on the x86 runner and skips the HTTP boot entirely — it
+    # only verifies the per-arch native modules (onnxruntime-node, @lancedb/lancedb) load,
+    # which is the actual packaging risk. With GHA layer caching the build step itself is
+    # a few minutes on a warm cache, so the whole job comfortably fits inside 90 min.
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
     steps:
@@ -137,17 +139,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .local
+          # GHA layer cache: subsequent runs reuse the base-image, npm-install, and
+          # model-bake layers across PRs and the daily reconciliation, so the incremental
+          # build collapses to a few minutes. mode=max caches every stage, not just the
+          # final one — the runtime stage inherits from an os-base stage whose layers are
+          # the expensive part.
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --target runtime \
             --build-arg PACKAGE_VERSION="${VERSION}" \
             --build-arg BUILD_REVISION="${GITHUB_SHA}" \
             --build-arg BUILD_SOURCE="https://github.com/${GITHUB_REPOSITORY}" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
             --provenance=false --sbom=false \
             --output type=oci,dest=.local/image.oci.tar \
             -f mcp/Dockerfile mcp
 
-      - name: Smoke-test both platforms (version, baked model, default HTTP)
+      - name: Smoke-test both platforms (version, baked model, HTTP on amd64 / native modules on arm64)
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
@@ -155,20 +164,28 @@ jobs:
               oci-archive:.local/image.oci.tar \
               "docker-archive:.local/scan-${arch}.tar:squadrules-scan:${arch}"
             docker load --input ".local/scan-${arch}.tar"
-            # scripts/ci-smoke-image.sh proves the HTTP server on this architecture: the
-            # zero-env default (baked TRANSPORT_TYPE=http) boots and serves /health with the
-            # embedded LanceDB backend, which also loads the per-arch native modules and the
-            # baked embedding model. It is torn down by SIGTERM.
+            # scripts/ci-smoke-image.sh legs 1–2 (package version, baked embedding model)
+            # run identically on both architectures. Leg 3 diverges per arch:
             #
-            # /health only answers after startup embeds the bundled adapters with the local
-            # ONNX model. That is CPU-bound inference: seconds natively, but the arm64 leg
-            # runs it under QEMU emulation on this x86 runner, which is roughly an order of
-            # magnitude slower and overruns the script's 600s default. Give the emulated leg
-            # a deadline sized for QEMU (the 120 min job timeout still bounds it); amd64 keeps
-            # the tight default so a genuinely hung native boot still fails fast.
+            # amd64 — full HTTP boot + /health assertion: natively it lands in ~40s and
+            # is the only leg that exercises the default env contract (baked
+            # TRANSPORT_TYPE=http, embedded LanceDB backend, SIGTERM handling).
+            #
+            # arm64 — runs under QEMU on this x86 runner, where the same boot would spend
+            # 45+ min on CPU-bound ONNX inference emulating boot-injection of every
+            # bundled adapter before /health ever answers. What actually has to be true
+            # on arm64 is that the per-arch native binaries (onnxruntime-node,
+            # @lancedb/lancedb — npm optional platform deps) shipped a working arm64
+            # build. SMOKE_SKIP_HEALTH=1 tells the script to prove exactly that with a
+            # require() check instead, which finishes in seconds. The 600s deadline is
+            # irrelevant on this leg but kept at the default so any future re-enable of
+            # the HTTP boot fails fast on a hung native start rather than silently
+            # burning the job budget.
             if [ "${arch}" = "arm64" ]; then
-              export SMOKE_CLUSTER_DEADLINE=4500
+              export SMOKE_SKIP_HEALTH=1
+              export SMOKE_CLUSTER_DEADLINE=600
             else
+              unset SMOKE_SKIP_HEALTH || true
               export SMOKE_CLUSTER_DEADLINE=600
             fi
             ./scripts/ci-smoke-image.sh "squadrules-scan:${arch}" "${VERSION}" \
