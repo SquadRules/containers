@@ -242,9 +242,10 @@ cosign verify \
 
 This repo is declared as code in
 [`jakub-plichcinski/iac-github`](https://github.com/jakub-plichcinski/iac-github)
-(`live/repos/squadrules/terragrunt.hcl`). Branch protection is added in a second IaC pass
-once the `Container image pipeline passed` check has reported on `main`. Repository-level
-security updates are enabled through that same IaC.
+(`live/repos/squadrules/terragrunt.hcl`). Branch protection is enforced on `main`
+(PR-only, two required status checks: `Container image pipeline passed` and
+`Security workflow passed`). Repository-level security updates are enabled through
+that same IaC.
 
 Dependabot (`.github/dependabot.yml`) tracks **GitHub Actions only**. The pinned base-image
 digest is deliberately *not* given a `docker` ecosystem entry: it is owned by the
