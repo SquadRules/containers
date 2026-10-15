@@ -136,7 +136,7 @@ jobs:
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
 
       - name: Export GitHub Actions cache runtime
-        uses: crazy-max/ghaction-github-runtime@v3
+        uses: crazy-max/ghaction-github-runtime@v4
 
       - name: Build immutable multi-platform OCI archive (from published npm)
         run: |
@@ -283,7 +283,7 @@ jobs:
           echo "arm64 SBOM: $(wc -c < "${out}") bytes -> ${out}"
 
       - name: Upload SBOMs
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ needs.resolve.outputs.version }}
           # Kept at `error`: the preceding steps now verify the artifacts exist on disk
@@ -292,7 +292,7 @@ jobs:
           # release with missing SBOMs.
           if-no-files-found: error
           retention-days: 90
-          # upload-artifact@v5 defaults include-hidden-files to false, which silently
+          # upload-artifact@v7 defaults include-hidden-files to false, which silently
           # drops anything under a dot-directory. SBOMs live in .local/, so without
           # this flag the glob matches nothing and if-no-files-found: error fails the
           # build even though the files are on disk.
@@ -305,14 +305,14 @@ jobs:
 
       - name: Upload OCI image for publication
         if: needs.resolve.outputs.publish == 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: image-oci-${{ needs.resolve.outputs.version }}
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
           # Same dot-directory trap as the SBOM upload: .local/image.oci.tar and
-          # .local/digest.txt are invisible to upload-artifact@v5 unless hidden
+          # .local/digest.txt are invisible to upload-artifact@v7 unless hidden
           # files are explicitly included.
           include-hidden-files: true
           path: |
