@@ -1,0 +1,291 @@
+# Release workflow for the SquadRules/containers packaging repo.
+#
+# This repo does NOT publish npm packages; the @squadrules/mcp npm artifact is
+# produced upstream in SquadRules/mcp. What this repo DOES publish is the
+# multi-arch, signed container image (docker.io + quay.io) via
+# .github/workflows/build-publish.yml.
+#
+# This workflow layers a GitHub Release surface on top of that existing
+# pipeline:
+#
+#   1. release-please    maintains CHANGELOG.md from conventional commits and
+#                        opens / merges a Release PR on push to main.
+#   2. publish           fires when release-please creates a GitHub Release,
+#                        verifies the matching container image is already
+#                        present in both registries (build-publish is the
+#                        source of truth for the image itself), downloads the
+#                        SPDX SBOMs from the originating build run, and
+#                        attaches them plus image references to the Release.
+#
+# Required secrets / vars:
+#   - RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY   GitHub App with contents:write
+#                                                + pull-requests:write on this
+#                                                repo (release-please needs an
+#                                                App token; GITHUB_TOKEN cannot
+#                                                produce unattended PR checks).
+#   - DOCKER_USERNAME / DOCKER_PASSWORD          Docker Hub credentials
+#                                                (skopeo verify only — this
+#                                                workflow does not push).
+#   - QUAY_USERNAME   / QUAY_PASSWORD            quay.io credentials
+#                                                (same caveat).
+#   - Variable QUAY_NAMESPACE                    quay.io namespace.
+#
+# The image itself is NEVER built or pushed from this workflow. If the image
+# is missing from either registry, the publish job fails loudly rather than
+# attaching SBOMs to an unreachable Release.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to retry publication for (for example v0.1.0)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      release_sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr_branch: ${{ steps.pr-meta.outputs.branch }}
+      pr_number: ${{ steps.pr-meta.outputs.number }}
+    steps:
+      - name: Require unattended release credentials
+        env:
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_APP_ID" ] || [ -z "$RELEASE_APP_PRIVATE_KEY" ]; then
+            echo "::error::Configure RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App. GITHUB_TOKEN cannot produce unattended PR checks."
+            exit 1
+          fi
+
+      - name: Create repository-scoped release App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Create or update Release PR / create GitHub Release
+        id: release
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Expose Release PR metadata
+        id: pr-meta
+        if: steps.release.outputs.prs_created == 'true' && steps.release.outputs.pr != ''
+        env:
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const pr = JSON.parse(process.env.PR_JSON);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `branch=${pr.headBranchName}\nnumber=${pr.number}\n`);
+          NODE
+
+  publish:
+    needs: release-please
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true') ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve release ref
+        id: release-ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CREATED_TAG: ${{ needs.release-please.outputs.tag_name }}
+          CREATED_SHA: ${{ needs.release-please.outputs.release_sha }}
+          RETRY_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW_TAG="$RETRY_TAG"
+          else
+            RAW_TAG="$CREATED_TAG"
+          fi
+          # Validate tag shape before it reaches any shell expansion: must be vX.Y.Z
+          # (release-please output) or a plain semver. Reject anything else — this
+          # guards the downstream jq `test()` regex and skopeo refs from injection.
+          if ! printf '%s' "$RAW_TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::Refusing to publish with unexpected tag shape: '$RAW_TAG'"
+            exit 1
+          fi
+          echo "ref=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout released source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.release-ref.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-ref.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Strip leading 'v' for the npm version comparison (release-please emits vX.Y.Z).
+          VERSION="${RELEASE_TAG#v}"
+
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease >/tmp/release.json
+          test "$(node -p "JSON.parse(require('node:fs').readFileSync('/tmp/release.json','utf8')).tagName")" = "$RELEASE_TAG"
+          test "$(node -p "JSON.parse(require('node:fs').readFileSync('/tmp/release.json','utf8')).isDraft")" = "false"
+          test "$(node -p "JSON.parse(require('node:fs').readFileSync('/tmp/release.json','utf8')).isPrerelease")" = "false"
+
+          git fetch origin main --tags
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-list -n 1 "$RELEASE_TAG")"
+          test "$HEAD_SHA" = "$TAG_SHA"
+          git merge-base --is-ancestor "$HEAD_SHA" origin/main
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Verified release tag: $RELEASE_TAG @ $HEAD_SHA"
+
+      - name: Locate originating build-publish run
+        id: build-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The image was built and published by build-publish.yml. Find the most
+          # recent successful run on main whose resolved-version step matches the
+          # release version, so we can pull its SBOM artifacts.
+          # VERSION has already been validated to semver shape; read it inside jq
+          # via env.VERSION (a jq literal, never shell-interpolated into the filter).
+          RUN_ID="$(gh run list \
+            --workflow build-publish.yml \
+            --branch main \
+            --status success \
+            --limit 20 \
+            --json databaseId,displayTitle \
+            --jq '.[] | select(.displayTitle | test("Resolved version: " + env.VERSION + "(\\s|$)")) | .databaseId' \
+            | head -n 1)"
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No build-publish run on main found for version $VERSION."
+            echo "::error::The image must be published by build-publish.yml BEFORE the GitHub Release is created."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Located build-publish run: $RUN_ID"
+
+      - name: Download SBOM artifacts from build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.build-run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p sboms
+          gh run download "$RUN_ID" --dir sboms --pattern 'sbom-*'
+          echo "Downloaded SBOMs:"
+          find sboms -type f | sort
+
+      - name: Verify image present in both registries
+        env:
+          VERSION: ${{ steps.verify-tag.outputs.version }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          QUAY_NAMESPACE: ${{ vars.QUAY_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          TAG="docker.io/squadrules/mcp:${VERSION}"
+          QUAY_TAG="quay.io/${QUAY_NAMESPACE}/mcp:${VERSION}"
+
+          for REF in "$TAG" "$QUAY_TAG"; do
+            echo "Verifying $REF ..."
+            if ! skopeo inspect --retry-times 3 "docker://${REF}" >/dev/null; then
+              echo "::error::$REF is not present in its registry."
+              echo "::error::build-publish.yml must publish the image BEFORE this release workflow runs."
+              exit 1
+            fi
+          done
+          echo "Image verified in both registries."
+
+      - name: Capture image references and digests
+        id: image-meta
+        env:
+          VERSION: ${{ steps.verify-tag.outputs.version }}
+          QUAY_NAMESPACE: ${{ vars.QUAY_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          DOCKER_REF="docker.io/squadrules/mcp:${VERSION}"
+          QUAY_REF="quay.io/${QUAY_NAMESPACE}/mcp:${VERSION}"
+
+          DOCKER_DIGEST="$(skopeo inspect --retry-times 3 --format '{{.Digest}}' "docker://${DOCKER_REF}")"
+          QUAY_DIGEST="$(skopeo inspect --retry-times 3 --format '{{.Digest}}' "docker://${QUAY_REF}")"
+
+          {
+            echo "## Container image"
+            echo ""
+            echo "| Registry | Reference | Digest |"
+            echo "| --- | --- | --- |"
+            echo "| Docker Hub | \`$DOCKER_REF\` | \`$DOCKER_DIGEST\` |"
+            echo "| quay.io    | \`$QUAY_REF\`    | \`$QUAY_DIGEST\` |"
+            echo ""
+            echo "Multi-arch manifest index: \`linux/amd64\` + \`linux/arm64\`. Signed with cosign keyless (Fulcio OIDC)."
+          } > /tmp/image-notes.md
+
+          cat /tmp/image-notes.md
+
+      - name: Attach SBOMs and image notes to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release-ref.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Flatten the downloaded SBOMs (gh run download nests per-artifact dirs).
+          find sboms -type f -name '*.spdx.json' -print0 | while IFS= read -r -d '' f; do
+            gh release upload "$RELEASE_TAG" "$f" --clobber
+          done
+
+          # Prepend the image-reference table to the existing release notes
+          # (release-please writes the CHANGELOG-derived body).
+          EXISTING="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
+          {
+            cat /tmp/image-notes.md
+            echo ""
+            echo "$EXISTING"
+          } > /tmp/combined-notes.md
+
+          gh release edit "$RELEASE_TAG" --notes-file /tmp/combined-notes.md
+          echo "Release $RELEASE_TAG updated with image references and SBOMs."

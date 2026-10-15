@@ -211,6 +211,23 @@ The image pipeline serialises runs per ref and cancels in-progress work only for
 so a scheduled or publishing run is never cancelled mid-push; the security workflow uses a per-ref
 group with `cancel-in-progress: true`, so only the latest run of a branch executes.
 
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml) — docs bot. Regenerates
+`.qoder/repowiki/en/content/` via the Qoder CLI when wiki source or the wiki plan changes on
+`main`, opens a docs-typed PR, auto-merges it via the `Docs` GitHub App, then publishes the
+rebuilt content to the GitHub Wiki tab through
+[`scripts/sync-wiki.sh`](scripts/sync-wiki.sh) (which in turn calls
+[`scripts/build-wiki.mjs`](scripts/build-wiki.mjs) to flatten the nested Qoder tree into a
+navigable Wiki). The wiki is code-derivable — never hand-edit `content/`.
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) — container release surface.
+`release-please` (simple release type, no `package.json` to bump) maintains `CHANGELOG.md` from
+conventional commits and creates a GitHub Release when its auto-PR merges. The `publish` job
+then verifies the matching image is present in **both** registries via `skopeo inspect`, pulls
+the SPDX SBOMs from the originating `build-publish.yml` run, and attaches them plus an
+image-reference table (refs + digests for docker.io and quay.io) to the Release notes. This
+workflow **never builds or pushes the image** — `build-publish.yml` remains the only publisher.
+`workflow_dispatch` accepts a `tag` input to retry publication for an existing release.
+
 ## Required configuration
 
 Secrets (repo → Settings → Secrets and variables → Actions):
@@ -219,12 +236,17 @@ Secrets (repo → Settings → Secrets and variables → Actions):
 |---|---|
 | `DOCKER_USERNAME` / `DOCKER_PASSWORD` | Docker Hub push |
 | `QUAY_USERNAME` / `QUAY_PASSWORD` | quay.io push |
+| `QODER_PERSONAL_ACCESS_TOKEN` | Qoder CLI auth for the docs-bot wiki regeneration |
+| `DOCS_APP_PRIVATE_KEY` | Docs GitHub App (opens + auto-merges the wiki-regen PR) |
+| `RELEASE_APP_PRIVATE_KEY` | Release GitHub App (release-please PRs and Release creation) |
 
 Variables:
 
 | Variable | Purpose |
 |---|---|
 | `QUAY_NAMESPACE` | quay.io namespace. Read as-is — nothing in the pipeline validates its shape, so a wrong or unset value surfaces as the quay.io reachability warning plus a failed publish/verify step |
+| `DOCS_APP_ID` | Docs GitHub App ID |
+| `RELEASE_APP_ID` | Release GitHub App ID |
 
 `cosign` keyless signing needs no secret; it uses the workflow's OIDC identity
 (`id-token: write`) and verifies against `https://github.com/${GITHUB_WORKFLOW_REF}`.
