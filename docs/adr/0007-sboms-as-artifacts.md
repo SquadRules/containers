@@ -64,3 +64,29 @@ finding must stay visible in it.
   needed, it would have to be generated out-of-band (e.g. by the GitHub
   Actions workflow itself) and attached after publish, again changing the
   digest. Not in scope for this pipeline.
+
+## Amendments
+
+The decision stands; the YAML above no longer matches the implementation. Two
+mechanical corrections, both learned from failures rather than chosen:
+
+- **2026-10-15 — SBOM generation calls the `trivy` CLI directly, not
+  `aquasecurity/trivy-action`.** `trivy-action@v0.36.0` is a composite action
+  that plumbs `input:` / `output:` / `format:` through a `./trivy_envs.txt`
+  shell-sourced file and then invokes `trivy image`. For tarball scans that
+  indirection proved unreliable: the step exited **0** while `TRIVY_OUTPUT` never
+  reached the child process, so no SBOM was written and the upload glob matched
+  nothing. The steps now run `trivy image --input … --format spdx-json
+  --list-all-pkgs --output …` with explicit absolute paths, install trivy via
+  `aquasecurity/setup-trivy` pinned to
+  `81e514348e19b6112ce2a7e3ecbafe19c1e1f567` (v0.3.1) at version `v0.70.0` — the
+  same pin trivy-action uses internally, so it is a no-op when the scan steps
+  already installed it — and each ends with a `test -s` post-check that turns a
+  silent no-op into a loud `::error::` in the same step.
+- **2026-10-15 — uploads use `actions/upload-artifact@v7` with
+  `include-hidden-files: true`.** v7 defaults that flag to `false`, which
+  silently drops anything under a dot-directory; every SBOM and the OCI archive
+  live in `.local/`, so without the flag the glob matches nothing even though the
+  files are on disk (`if-no-files-found: error` then fails the build for the
+  right reason but the wrong cause). SBOM retention is unchanged at 90 days;
+  the image archive artifact is retained 7 days with `compression-level: 0`.
