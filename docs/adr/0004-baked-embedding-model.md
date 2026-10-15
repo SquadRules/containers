@@ -73,3 +73,24 @@ reproducible in practice.
   0.0.0, whose universal stub ships no linux-arm64 binary, so the local
   embedding path cannot work on arm64 without the bump. Fix at source in
   `SquadRules/mcp`.
+
+## Amendments
+
+- **2026-10-15 — the small-model default has landed.** A build packaging
+  `@squadrules/mcp` 5.4.1 bakes `/opt/squadrules/models` at **~65 MB**, so the
+  first consequence's conditional ("adds ~65 MB once mcp ships the small-model
+  default") is now the normal case rather than a future one; the ~209 MB figure
+  applies only to builds of 5.1.0 and earlier, which still pointed at
+  `bge-base-en-v1.5`. The whole image measures **~1.2 GB** instead of ~1.5 GB —
+  see the [ADR-0001](0001-node24-bookworm-slim-base.md) amendment for the
+  component breakdown.
+- **2026-10-15 — the arm64 rationale is confirmed against the registry, not just
+  inferred.** `npm view` shows `@anush008/tokenizers@0.0.0` publishing optional
+  platform packages for `linux-x64-gnu`, `win32-x64-msvc` and
+  `darwin-universal` only, while `0.6.0` adds `linux-arm64-gnu` and
+  `linux-arm64-musl`; `fastembed@3.0.0` depends on `"@anush008/tokenizers":
+  "^0.0.0"`, and a caret on `0.0.x` admits exactly `0.0.0`. The two images show
+  the difference directly: the published Alpine build carries a ~1 MB stub of
+  that package, the current build a ~5 MB arm64 binary. The override is doing
+  precisely what this ADR claims, and `@squadrules/mcp` has not yet taken it at
+  source, so the `deps` stage line must stay until it does.

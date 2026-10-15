@@ -69,3 +69,22 @@ the npm CLI, so those libraries are no longer present in the image at all.
   [ADR-0008](0008-os-base-scan-target.md).
 - The `exp:` dates are a maintenance commitment. The expiry guard script is
   the enforcement mechanism; it runs in the Security workflow.
+
+## Amendments
+
+- **2026-10-15 — the register holds 13 entries, not 11.** The `libgnutls30` pair
+  (`CVE-2026-88647`, `CVE-2026-88648`) was added by `2404cbb` on 2026-10-12,
+  after this ADR was written. All 13 active entries still share the single
+  2027-04-01 review date, so the expiry guard has one deadline to guard rather
+  than several. No decision changed: the additions are `affected`-state findings
+  that neither the pinned digest nor the `apt-get upgrade` layer can close, and
+  `libgnutls30` reaches the image only through `apt` at build time — the runtime
+  stage invokes neither `apt` nor gnutls, and Node links its own OpenSSL.
+- **2026-10-15 — composition of the register.** Seven of the thirteen entries are
+  the util-linux family (one source package, eight binary packages per CVE) and
+  its `libsystemd0`/`libudev1` and `libacl1` dependents, so a single source
+  package generates most of the register's volume. The only entry annotated
+  CRITICAL is `CVE-2023-45853` (zlib1g, `will_not_fix` in bookworm — closeable
+  only by moving the base to a Debian release that carries zlib 1.3). That
+  concentration is the argument for the per-family reachability rationale over
+  per-CVE essays.

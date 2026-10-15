@@ -3,6 +3,9 @@
 *.tar
 *.oci.tar
 
+# Qoder wiki-plan scratch (generated locally, not part of the repo artefacts).
+.qoder/
+
 # OS / editor noise
 .DS_Store
 *.swp

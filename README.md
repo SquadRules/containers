@@ -15,7 +15,7 @@ merge in the application repo. It mirrors the earlier extraction of the Helm cha
 
 | Image | References |
 |---|---|
-| `docker.io/squadrules/mcp` | `:<version>`, plus `latest`, `:<major>`, `:<major>.<minor>` for stable releases |
+| `docker.io/squadrules/mcp` | `:<version>`, plus `latest`, `:<major>`, `:<major>.<minor>` for stable releases; a prerelease `X.Y.Z-<channel>.N` publishes only the `<channel>` tag |
 | `quay.io/${QUAY_NAMESPACE}/mcp` | same tags as Docker Hub |
 
 Both are multi-arch (`linux/amd64`, `linux/arm64`) and signed with
@@ -85,8 +85,10 @@ context from [`SquadRules/charts`](https://github.com/SquadRules/charts) — the
 ### Baked embedding model
 
 The zero-config embedding backend (fastembed) would otherwise download ONNX weights on first
-use — impossible on a read-only root filesystem or an air-gapped node, and it is the reason a
-cold `/health` takes ~2 minutes. The build fetches them once into the image via fastembed's
+use — impossible on a read-only root filesystem or an air-gapped node, and the reason an
+unbaked cold boot was measured at ~2 minutes. With the weights baked in, a `linux/arm64` cold
+boot answered `/health` in **~50 s** (single sample, Apple Silicon host). The build fetches them
+once into the image via fastembed's
 own `retrieveModel()`, using the model id **read from the installed package**, so the baked
 layout is exactly what the app looks for and the image is self-contained: users pull once
 instead of running a StatefulSet or re-downloading at every boot. This is safe to freeze
@@ -106,18 +108,25 @@ gate.
   inside the container; upgrade by rebuilding the image at a new `PACKAGE_VERSION`.
 * **`SIGTERM` needs `--init`** (or `shareProcessNamespace: true` in Kubernetes), as described
   above.
-* The image is ~1.5 GB, dominated by `onnxruntime-node` (~208 MB unpacked), LanceDB's native
-  bindings and the model weights. Debian `bookworm-slim` rather than Alpine is required by
-  onnxruntime-node, which ships glibc-only binaries.
+* The image is **~1.2 GB** (`docker images`, linux/arm64 build of the current Dockerfile). Measured
+  in place: `/app/node_modules` ~530 MB — of which `onnxruntime-node` is ~208 MB and LanceDB's
+  native bindings ~137 MB — the Debian base under `/usr` ~223 MB, and the baked model ~65 MB. The
+  ~1.5 GB figure recorded in [ADR-0004](docs/adr/0004-baked-embedding-model.md) predates the
+  small-model default, when the baked weights were ~209 MB. Debian `bookworm-slim` rather than
+  Alpine is required by onnxruntime-node, which ships glibc-only binaries.
 
 ## Build contract
 
-[`mcp/Dockerfile`](mcp/Dockerfile) is a pure packaging Dockerfile — three stages, no source:
+[`mcp/Dockerfile`](mcp/Dockerfile) is a pure packaging Dockerfile — four named stages
+(`deps` → `model` → `os-base` → `runtime`), no source:
 
 1. `deps` — pinned `node:24-bookworm-slim@sha256:…`; a synthetic npm root that installs
    `@squadrules/mcp@${PACKAGE_VERSION}` at an exact version with the published package's own
    security `overrides` read back from the registry (npm applies `overrides` only to the root
-   project being installed), plus `npm install --omit=dev --ignore-scripts`.
+   project being installed), plus one packaging override: `@anush008/tokenizers` is forced to
+   `^0.6.0` because fastembed's `^0.0.0` resolves to a stub with no linux-arm64 binary, which
+   would break the key-free local embedding path on arm64. Installed with
+   `npm install --omit=dev --ignore-scripts`.
 2. `model` — bakes the local embedding model the installed package defaults to.
 3. `os-base` — the same pinned digest, `apt-get upgrade` and `libgomp1` (for the ONNX CPU
    provider) in one layer.
@@ -151,25 +160,56 @@ coupling that made the old Alpine version of that job brittle.
 [`.github/workflows/build-publish.yml`](.github/workflows/build-publish.yml) — the image
 pipeline. Triggers:
 
-- **`schedule` (hourly)** — reconciliation against npm `latest`. No-op when the tag already
-  exists.
+- **`schedule` (daily, 04:17 UTC)** — reconciliation against npm `latest`. No-op only when the
+  tag exists in **both** registries; a tag present on docker.io but missing on quay.io is
+  reported as a partial publish and the run continues so quay.io catches up.
 - **`workflow_dispatch`** — manual build for an explicit `version` (or latest), with `force`
   and `dry-run` flags.
 - **`pull_request`** — build + smoke-test + scan **only** (no publish) to gate
   Dockerfile/`.trivyignore` changes.
 
-Steps: resolve version → `docker buildx build` (multi-arch OCI, `--provenance=false
---sbom=false` so the built digest can be re-pushed verbatim) → per-arch `skopeo` extract and
-`docker load` → [`scripts/ci-smoke-image.sh`](scripts/ci-smoke-image.sh) (package version,
-baked model present, the **zero-env default** booting `TRANSPORT_TYPE=http` and serving
-`/health` with the embedded backend, and a graceful `SIGTERM` stop) → Trivy
-`CRITICAL,HIGH` per arch (`.trivyignore`) → unfiltered SPDX SBOM per arch uploaded as a
-workflow artifact → `skopeo copy` to both registries → `cosign sign`/`verify` → promote aliases.
+Steps: resolve version (semver validated; the `publish` and `skip` outputs gate every
+downstream job) → `docker buildx build` (multi-arch OCI, with GitHub-Actions layer caching at
+`mode=max` so the base-image, `npm install` and model-bake layers are reused across PRs and the
+daily run; `--provenance=false --sbom=false` so the built digest can be re-pushed verbatim) →
+per-arch `skopeo` extract and `docker load` → [`scripts/ci-smoke-image.sh`](scripts/ci-smoke-image.sh) →
+Trivy `CRITICAL,HIGH` per arch (`.trivyignore`) → unfiltered SPDX SBOM per arch uploaded as a
+workflow artifact → publish to both registries → verify the published tags resolve.
+
+The script has three legs. Legs 1 and 2 run identically on both architectures (the package
+version inside the image matches the npm version it was built from; the embedding model is
+baked in). Leg 3 diverges: **amd64** boots the **zero-env default** and asserts `/health` answers
+`status=healthy` on `transport=http` with the `embedded-lancedb` backend, then stops gracefully on
+`SIGTERM`; **arm64** runs under QEMU on the x86 runner, where that same boot would spend 45+
+minutes on emulated ONNX inference, so `SMOKE_SKIP_HEALTH=1` replaces it with a `require()` check
+that `onnxruntime-node` and `@lancedb/lancedb` load on the target arch — the actual packaging
+risk, since npm optional platform dependencies are per-arch.
+
+Publishing treats **each registry as an independent atomic unit**: push the immutable version tag
+(`skopeo copy --all --preserve-digests`), `cosign sign` and `cosign verify` that digest, then
+promote the channel aliases by copying the same digest. One registry failing no longer aborts the
+other — which previously left docker.io holding an unsigned version tag with no aliases whenever
+quay.io failed — though the step still exits non-zero if any registry failed, so branch
+protection is preserved. A pre-flight probe of the quay.io tag list raises a warning before the
+loop, because a missing repository and a missing permission are otherwise indistinguishable from
+an opaque push error.
 
 [`.github/workflows/security.yml`](.github/workflows/security.yml) — `.trivyignore` expiry
 guard, plus a Trivy scan of the `os-base` stage (`vuln-type: os`, CRITICAL,HIGH, `.trivyignore`)
 that auto-remediates by bumping the pinned base digest — which is how a newer Node patch release
-gets pulled in (PR flow commits to the branch; schedule/push flow opens an auto-merge PR).
+gets pulled in (PR flow commits to the branch; schedule/push flow opens an auto-merge PR). The OS
+layer is built straight from the Dockerfile with `--target os-base` rather than re-assembled from
+grepped lines, so the job cannot drift from what ships; the replacement digest is resolved as the
+multi-arch **manifest index** digest via `docker buildx imagetools inspect` (a per-platform digest
+would break the other architecture), and the bumped layer is rescanned before anything is
+committed.
+
+Both workflows end in an aggregate job that is the branch-protection surface: `Container image
+pipeline passed` and `Security workflow passed`. Neither workflow filters the `pull_request`
+trigger by paths — a filter would strand non-image PRs on a required check that never runs.
+The image pipeline serialises runs per ref and cancels in-progress work only for pull requests,
+so a scheduled or publishing run is never cancelled mid-push; the security workflow uses a per-ref
+group with `cancel-in-progress: true`, so only the latest run of a branch executes.
 
 ## Required configuration
 
@@ -184,7 +224,7 @@ Variables:
 
 | Variable | Purpose |
 |---|---|
-| `QUAY_NAMESPACE` | quay.io namespace (validated `^[a-z0-9][a-z0-9_-]+$`) |
+| `QUAY_NAMESPACE` | quay.io namespace. Read as-is — nothing in the pipeline validates its shape, so a wrong or unset value surfaces as the quay.io reachability warning plus a failed publish/verify step |
 
 `cosign` keyless signing needs no secret; it uses the workflow's OIDC identity
 (`id-token: write`) and verifies against `https://github.com/${GITHUB_WORKFLOW_REF}`.
@@ -197,6 +237,20 @@ cosign verify \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   docker.io/squadrules/mcp:<version>
 ```
+
+## Repository provisioning
+
+This repo is declared as code in
+[`jakub-plichcinski/iac-github`](https://github.com/jakub-plichcinski/iac-github)
+(`live/repos/squadrules/terragrunt.hcl`). Branch protection is enforced on `main`
+(PR-only, two required status checks: `Container image pipeline passed` and
+`Security workflow passed`). Repository-level security updates are enabled through
+that same IaC.
+
+Dependabot (`.github/dependabot.yml`) tracks **GitHub Actions only**. The pinned base-image
+digest is deliberately *not* given a `docker` ecosystem entry: it is owned by the
+`container-base-os-trivy` job in [`.github/workflows/security.yml`](.github/workflows/security.yml),
+and letting two mechanisms edit the same `FROM` line would have them fight over it.
 
 ## Architecture decisions
 
