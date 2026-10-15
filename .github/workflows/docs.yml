@@ -1,0 +1,190 @@
+# Docs bot: regenerate the Qoder wiki when source changes, open a docs-typed PR,
+# and auto-merge via the Docs GitHub App. This keeps the wiki in sync with the
+# repo without manual intervention. The wiki is code-derivable (never hand-edit
+# .qoder/repowiki/en/content/); this workflow regenerates it from source.
+#
+# Triggers: workflow_dispatch (manual) and push to main when wiki source or the
+# wiki plan changes. The docs bot uses QODER_PERSONAL_ACCESS_TOKEN to run the
+# Qoder CLI wiki generation, and DOCS_APP_ID + DOCS_APP_PRIVATE_KEY to create
+# and auto-merge the PR.
+#
+# Required secrets / vars:
+#   - QODER_PERSONAL_ACCESS_TOKEN   Qoder CLI auth for wiki generation.
+#   - DOCS_APP_PRIVATE_KEY          Docs GitHub App private key.
+#   - DOCS_APP_ID                   Docs GitHub App ID (var).
+#
+# Required repo state:
+#   - Wiki tab initialised (visit /wiki/create once).
+#   - `.qoder/repowiki/wiki_plan.yaml` present (steers the build).
+
+name: Docs wiki regeneration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.qoder/repowiki/en/content/**'
+      - '.qoder/repowiki/wiki_plan.yaml'
+      - 'scripts/build-wiki.mjs'
+      - 'scripts/sync-wiki.sh'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate-wiki:
+    name: Regenerate Qoder wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - name: Generate GitHub App token (Docs bot)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.DOCS_APP_ID }}
+          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+
+      - name: Regenerate Qoder wiki
+        env:
+          QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Qoder CLI wiki generation (regenerates .qoder/repowiki/en/content/ from source).
+          # The wiki is code-derivable; this workflow keeps it fresh.
+          npx -y @qoder-ai/qodercli@latest wiki --repo . --language en
+          echo "Wiki regenerated at $(date -u)"
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet .qoder/repowiki/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No wiki changes detected."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Wiki changes detected:"
+            git diff --stat .qoder/repowiki/
+          fi
+
+      - name: Create docs PR
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="docs/wiki-regen-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add .qoder/repowiki/
+          git commit -m "docs: regenerate Qoder wiki"
+          git push origin "$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "docs: regenerate Qoder wiki" \
+            --body "Automated wiki regeneration from source. This PR was opened by the Docs bot workflow." \
+            --label "documentation,automerge"
+          echo "PR created for branch $BRANCH"
+
+  auto-merge:
+    name: Auto-merge docs PR
+    needs: regenerate-wiki
+    if: needs.regenerate-wiki.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate GitHub App token (Docs bot)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.DOCS_APP_ID }}
+          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Auto-merge the docs PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Find the most recent docs PR opened by the bot (within the automation window).
+          PR_NUMBER=$(gh pr list --state open --author "github-actions[bot]" --label "documentation,automerge" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No docs PR found to auto-merge."
+            exit 0
+          fi
+          echo "Auto-merging PR #$PR_NUMBER"
+          gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+          echo "Auto-merge enabled for PR #$PR_NUMBER"
+
+  sync-wiki:
+    name: Publish wiki to GitHub Wiki
+    needs: regenerate-wiki
+    if: needs.regenerate-wiki.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate GitHub App token (Docs bot)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.DOCS_APP_ID }}
+          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout source repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+
+      - name: Verify wiki repository exists
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          WIKI_URL="https://github.com/${{ github.repository }}.wiki.git"
+          echo "Checking if wiki repository exists..."
+          if ! git ls-remote "$WIKI_URL" >/dev/null 2>&1; then
+            echo "::error::Wiki repository ${{ github.repository }}.wiki does not exist or is not accessible."
+            echo "::error::Please initialize the wiki by visiting https://github.com/${{ github.repository }}/wiki/create"
+            exit 1
+          fi
+          echo "Wiki repository exists, proceeding with sync."
+
+      - name: Checkout wiki repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Sync content and push to wiki
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          WIKI_TITLE: SQUADRULES CONTAINERS
+        run: WIKI_WORKDIR=wiki bash scripts/sync-wiki.sh
