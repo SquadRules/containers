@@ -39,6 +39,10 @@ name: Release
 on:
   push:
     branches: [main]
+    paths:
+      - 'mcp/Dockerfile'
+      - '.trivyignore'
+      - 'scripts/**'
   workflow_dispatch:
     inputs:
       tag:
