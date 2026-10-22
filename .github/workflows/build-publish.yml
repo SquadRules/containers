@@ -163,6 +163,10 @@ jobs:
       - name: Export GitHub Actions cache runtime
         uses: crazy-max/ghaction-github-runtime@v4
 
+      - name: Log in to GHCR (for registry cache)
+        if: inputs.cache-type == 'registry' || inputs.cache-type == 'hybrid'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: Build immutable multi-platform OCI archive (from published npm)
         id: build
         env:
