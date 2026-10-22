@@ -39,6 +39,14 @@ on:
         description: Build and scan only; do not sign, publish, promote, or dispatch
         type: boolean
         default: false
+      cache-type:
+        description: 'Cache backend for build time comparison: gha (baseline), registry (BUILDKIT_INLINE_CACHE), hybrid (both)'
+        type: choice
+        options:
+          - gha
+          - registry
+          - hybrid
+        default: gha
   push:
     branches: [main]
     paths:
@@ -126,12 +134,18 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    outputs:
+      build_duration_seconds: ${{ steps.build.outputs.build_duration_seconds }}
+      cache_type: ${{ steps.build.outputs.cache_type }}
     # The amd64 leg boots the full HTTP server and asserts /health (~40s natively). The
     # arm64 leg runs under QEMU on the x86 runner and skips the HTTP boot entirely — it
     # only verifies the per-arch native modules (onnxruntime-node, @lancedb/lancedb) load,
     # which is the actual packaging risk. With GHA layer caching the build step itself is
     # a few minutes on a warm cache, so the whole job comfortably fits inside 90 min.
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # GHCR build cache
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
     steps:
@@ -149,26 +163,61 @@ jobs:
       - name: Export GitHub Actions cache runtime
         uses: crazy-max/ghaction-github-runtime@v4
 
+      - name: Log in to GHCR (for registry cache)
+        if: inputs.cache-type == 'registry' || inputs.cache-type == 'hybrid'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
       - name: Build immutable multi-platform OCI archive (from published npm)
+        id: build
+        env:
+          CACHE_TYPE: ${{ inputs.cache-type || 'gha' }}
         run: |
           set -euo pipefail
           mkdir -p .local
-          # GHA layer cache: subsequent runs reuse the base-image, npm-install, and
-          # model-bake layers across PRs and the daily reconciliation, so the incremental
-          # build collapses to a few minutes. mode=max caches every stage, not just the
-          # final one — the runtime stage inherits from an os-base stage whose layers are
-          # the expensive part.
+          # Cache configuration for build time comparison:
+          #   gha      — GHA layer cache only (baseline)
+          #   registry — BUILDKIT_INLINE_CACHE=1 with registry cache
+          #   hybrid   — both GHA and registry cache
+          case "${CACHE_TYPE}" in
+            gha)
+              cache_from="--cache-from type=gha"
+              cache_to="--cache-to type=gha,mode=max"
+              inline_cache=""
+              ;;
+            registry)
+              cache_from="--cache-from type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache"
+              cache_to="--cache-to type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache,mode=max"
+              inline_cache="--build-arg BUILDKIT_INLINE_CACHE=1"
+              ;;
+            hybrid)
+              cache_from="--cache-from type=gha --cache-from type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache"
+              cache_to="--cache-to type=gha,mode=max --cache-to type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache,mode=max"
+              inline_cache="--build-arg BUILDKIT_INLINE_CACHE=1"
+              ;;
+            *)
+              echo "::error::Unknown cache type: ${CACHE_TYPE}"; exit 1
+              ;;
+          esac
+          echo "::notice::Using cache type: ${CACHE_TYPE}"
+          start_time=$(date +%s)
+          # shellcheck disable=SC2086
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --target runtime \
             --build-arg PACKAGE_VERSION="${VERSION}" \
             --build-arg BUILD_REVISION="${GITHUB_SHA}" \
             --build-arg BUILD_SOURCE="https://github.com/${GITHUB_REPOSITORY}" \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+            ${inline_cache} \
+            ${cache_from} \
+            ${cache_to} \
             --provenance=false --sbom=false \
             --output type=oci,dest=.local/image.oci.tar \
             -f mcp/Dockerfile mcp
+          end_time=$(date +%s)
+          duration=$((end_time - start_time))
+          echo "::notice::Build completed in ${duration}s (cache=${CACHE_TYPE})"
+          echo "build_duration_seconds=${duration}" >> "$GITHUB_OUTPUT"
+          echo "cache_type=${CACHE_TYPE}" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test both platforms (version, baked model, HTTP on amd64 / native modules on arm64)
         run: |
