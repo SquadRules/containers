@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/SquadRules/containers/compare/v1.1.0...v1.2.0) (2026-10-22)
+
+
+### Features
+
+* add auto-update PR branches workflow ([#17](https://github.com/SquadRules/containers/issues/17)) ([f31ff3b](https://github.com/SquadRules/containers/commit/f31ff3babd724d85dad8f845da799d6d50060f3b))
+
 ## [1.1.0](https://github.com/SquadRules/containers/compare/v1.0.0...v1.1.0) (2026-10-22)
 
 
