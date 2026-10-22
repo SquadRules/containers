@@ -1,0 +1,102 @@
+# Sequentially update, check, and merge open PRs.
+# Triggers on push to main plus an hourly backstop run.
+# PRs are processed one at a time: update the branch, wait for checks, merge if
+# green, then move to the next. Each successful merge pushes to main, which
+# retriggers this workflow for the remaining PRs. This avoids running
+# `gh pr update-branch` on all open branches on every run, which hits branches
+# with redundant updates. No local clone/merge/push, and no mergeStateStatus
+# polling - that field is recomputed asynchronously and is stale right after
+# the push that triggers this run, so filtering on it silently finds nothing.
+# Uses the SquadRules auto GitHub App for write access to PR branches.
+name: Auto-update PR branches
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Backstop: anything a push-triggered run missed (API blip, transient
+    # failure) is retried here instead of waiting for the next push to main.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: auto-update-prs
+  cancel-in-progress: false
+
+jobs:
+  update-prs:
+    name: Update open PR branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Generate GitHub App token (SquadRules auto)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Sequentially update, check, and merge open PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Candidates: open PRs into main, not draft, no no-auto-update label.
+          # NOTE: --limit 100 caps at 100 open PRs.
+          PRS=$(gh pr list --repo "$REPO" --state open --base main --limit 100 \
+            --json number,isDraft,labels \
+            --jq '.[] | select(.isDraft == false and ([.labels[].name] | contains(["no-auto-update"]) | not)) | .number')
+
+          if [ -z "$PRS" ]; then
+            echo "No open PRs to consider"
+            exit 0
+          fi
+
+          # Process PRs sequentially: update branch, wait for checks, merge if green.
+          # Each merge pushes to main, which retriggers this workflow for the
+          # remaining PRs. This avoids running update-branch on all open branches
+          # on every run, which hits branches with redundant updates.
+          while IFS= read -r PR; do
+            # PR identifiers come from gh pr list; accept digits only so no
+            # event-derived value can reach the shell unvalidated.
+            if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Unexpected PR identifier from list: '$PR'"
+              continue
+            fi
+
+            # gh pr update-branch exits 0 both when it merges and when the branch
+            # is already current. Capture output to distinguish the two cases.
+            UPDATE_OUT=$(gh pr update-branch "$PR" --repo "$REPO" 2>&1) || {
+              echo "::warning::gh pr update-branch failed for PR #$PR: $UPDATE_OUT"
+              continue
+            }
+
+            if echo "$UPDATE_OUT" | grep -qi "already up to date"; then
+              echo "PR #$PR already up to date, skipping"
+              continue
+            fi
+
+            echo "PR #$PR branch updated, waiting for checks..."
+
+            # --watch blocks until all checks complete; --fail-fast aborts on first
+            # failing check and exits non-zero.
+            if ! gh pr checks "$PR" --repo "$REPO" --watch --fail-fast; then
+              echo "::warning::Checks failed for PR #$PR, skipping merge"
+              continue
+            fi
+
+            if gh pr merge "$PR" --repo "$REPO" --squash; then
+              echo "PR #$PR merged"
+            else
+              echo "::warning::Merge failed for PR #$PR"
+            fi
+          done <<< "$PRS"
