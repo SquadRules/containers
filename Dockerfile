@@ -1,6 +1,9 @@
 # Package the published npm release; no application source build.
 FROM node:24-bookworm-slim
 
+LABEL org.opencontainers.image.source="https://github.com/SquadRules/containers" \
+      org.opencontainers.image.description="SquadRules MCP packaged from npm"
+
 WORKDIR /opt/squadrules
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund \
