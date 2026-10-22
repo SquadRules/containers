@@ -7,7 +7,10 @@
 # Decoupling contract: this pipeline is the ONLY place image build/scan/sign/publish
 # happens. An image/OS/library CVE here can never block an npm release or a code merge in
 # SquadRules/mcp. The mcp release pipeline publishes npm only; this repo builds images
-# independently via schedule (hourly npm poll), push (Dockerfile/trivyignore/release-please), workflow_dispatch, or pull_request.
+# independently via schedule (hourly npm poll), push (Dockerfile/trivyignore/release-please),
+# workflow_dispatch, or pull_request. Builds are content-addressable: the resolve job computes
+# sha256(Dockerfile + PACKAGE_VERSION)[:12] and skips when the fingerprint tag already exists
+# in both registries, avoiding redundant rebuilds.
 #
 # Triggers:
 #   - schedule (hourly)                   — reconciliation against npm latest.
@@ -75,9 +78,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      fingerprint: ${{ steps.resolve.outputs.fingerprint }}
       publish: ${{ steps.resolve.outputs.publish }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Resolve version and publish intent
         id: resolve
         env:
@@ -101,30 +110,37 @@ jobs:
           echo "Resolved target version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+          # Compute build fingerprint (content-addressable cache key).
+          # The fingerprint is sha256(Dockerfile + PACKAGE_VERSION)[:12], which uniquely
+          # identifies the build inputs. Same inputs = same fingerprint = same image.
+          fingerprint="$(cat mcp/Dockerfile | sha256sum | cut -d' ' -f1 | cut -c1-12)-${version}"
+          echo "Build fingerprint: $fingerprint"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
           # Publish only outside pull requests and not during a dry run.
           publish=true
           if [ "$EVENT_NAME" = "pull_request" ]; then publish=false; fi
           if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then publish=false; fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
-          # Idempotency: only the scheduled reconciliation poll skips when the canonical tag
-          # exists in BOTH registries. Push events (Dockerfile/trivyignore changes) always
-          # rebuild to ensure the image reflects the latest recipe. Checking docker.io alone
-          # masked partial publishes: if docker.io succeeded but quay.io failed, every later
-          # run skipped and quay.io never caught up.
+          # Fingerprint-based skip: check if this exact build already exists in BOTH registries.
+          # The fingerprint is content-addressable: sha256(Dockerfile + PACKAGE_VERSION)[:12].
+          # Same inputs = same fingerprint = same image, so we can safely skip the build.
+          # Checking both regist avoids partial publish: if docker.io succeeded but quay.io
+          # failed, we rebuild to sync both registries.
           skip=false
-          if [ "$EVENT_NAME" = "schedule" ] && [ "$publish" = "true" ] && [ "${INPUT_FORCE:-false}" != "true" ]; then
+          if [ "$publish" = "true" ] && [ "${INPUT_FORCE:-false}" != "true" ]; then
             sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
-            docker_ref="docker://docker.io/squadrules/mcp:${version}"
-            quay_ref="docker://quay.io/${QUAY_NAMESPACE}/mcp:${version}"
+            docker_ref="docker://docker.io/squadrules/mcp:${fingerprint}"
+            quay_ref="docker://quay.io/${QUAY_NAMESPACE}/mcp:${fingerprint}"
             have_docker=false; have_quay=false
             if skopeo inspect --no-tags "${docker_ref}" >/dev/null 2>&1; then have_docker=true; fi
             if skopeo inspect --no-tags "${quay_ref}" >/dev/null 2>&1; then have_quay=true; fi
             if [ "$have_docker" = "true" ] && [ "$have_quay" = "true" ]; then
-              echo "Image tag ${version} already published to docker.io and quay.io; skipping."
+              echo "Fingerprint ${fingerprint} already published to docker.io and quay.io; skipping build."
               skip=true
             elif [ "$have_docker" = "true" ]; then
-              echo "::warning::Partial publish detected for ${version}: present on docker.io but missing on quay.io/${QUAY_NAMESPACE}/mcp — proceeding to retry the publish so quay.io catches up."
+              echo "::warning::Partial publish detected for ${fingerprint}: present on docker.io but missing on quay.io/${QUAY_NAMESPACE}/mcp — proceeding to rebuild."
             fi
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
@@ -133,6 +149,8 @@ jobs:
     name: Build, smoke-test and scan (linux/amd64 + linux/arm64)
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
+    # Skipped when fingerprint tag already exists in both registries (content-addressable cache).
+    # The resolve job computes sha256(Dockerfile + PACKAGE_VERSION)[:12] and checks the registry.
     runs-on: ubuntu-latest
     outputs:
       build_duration_seconds: ${{ steps.build.outputs.build_duration_seconds }}
@@ -391,6 +409,7 @@ jobs:
       id-token: write # cosign keyless signing (Fulcio OIDC)
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
+      FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
       QUAY_NAMESPACE: ${{ vars.QUAY_NAMESPACE }}
       QUAY_IMAGE: quay.io/${{ vars.QUAY_NAMESPACE }}/mcp
     steps:
@@ -467,21 +486,30 @@ jobs:
               ;;
           esac
 
-          # Publish ONE registry end-to-end: push the immutable version tag (preserving the
-          # built digest), sign and verify that digest, then promote the channel aliases.
-          # Returns 0 only when the whole sequence succeeded for this target.
+          # Publish ONE registry end-to-end: push the fingerprint tag (primary, immutable),
+          # then the version tag (backward compatibility), sign and verify that digest,
+          # then promote the channel aliases. Returns 0 only when the whole sequence
+          # succeeded for this target.
           publish_one() {
             local target="$1"
             local tag
 
+            # Push fingerprint tag (primary, content-addressable)
             if ! skopeo copy --all --preserve-digests --authfile "${authfile}" \
-              oci-archive:.local/image.oci.tar "docker://${target}:${VERSION}"; then
-              echo "::error::Publish FAILED for ${target}:${VERSION} — immutable tag push did not complete"
+              oci-archive:.local/image.oci.tar "docker://${target}:${FINGERPRINT}"; then
+              echo "::error::Publish FAILED for ${target}:${FINGERPRINT} — fingerprint tag push did not complete"
               case "${target}" in
                 quay.io/*)
                   echo "::error::quay.io push failed — verify robot token has write permission on ${QUAY_NAMESPACE}/mcp"
                   ;;
               esac
+              return 1
+            fi
+
+            # Push version tag (backward compatibility, points to same digest)
+            if ! skopeo copy --all --preserve-digests --authfile "${authfile}" \
+              "docker://${target}@${digest}" "docker://${target}:${VERSION}"; then
+              echo "::error::Publish FAILED for ${target}:${VERSION} — version tag push did not complete"
               return 1
             fi
 
@@ -507,7 +535,7 @@ jobs:
               fi
             done
 
-            echo "Published ${target}:${VERSION} (${digest}) signed, aliases: ${tags}"
+            echo "Published ${target}:${FINGERPRINT} + ${target}:${VERSION} (${digest}) signed, aliases: ${tags}"
             return 0
           }
 
@@ -515,7 +543,7 @@ jobs:
           failed_targets=""
           for target in ${targets}; do
             if publish_one "${target}"; then
-              echo "::notice::Publish succeeded for ${target}:${VERSION} (signed, aliases promoted)"
+              echo "::notice::Publish succeeded for ${target}:${FINGERPRINT} + ${target}:${VERSION} (signed, aliases promoted)"
             else
               failed_targets="${failed_targets} ${target}"
             fi
@@ -532,15 +560,20 @@ jobs:
         run: |
           set -euo pipefail
           authfile="${HOME}/.docker/config.json"
-          docker_ref="docker://docker.io/squadrules/mcp:${VERSION}"
-          quay_ref="docker://${QUAY_IMAGE}:${VERSION}"
           failed=false
-          docker_digest="$(skopeo inspect --authfile "${authfile}" --format '{{.Digest}}' "${docker_ref}" 2>/dev/null)" \
-            || { echo "::error::Publish verification failed for docker.io/squadrules/mcp:${VERSION}"; failed=true; }
-          quay_digest="$(skopeo inspect --authfile "${authfile}" --format '{{.Digest}}' "${quay_ref}" 2>/dev/null)" \
-            || { echo "::error::Publish verification failed for ${QUAY_IMAGE}:${VERSION}"; failed=true; }
+          
+          # Verify both fingerprint and version tags
+          for tag in "${FINGERPRINT}" "${VERSION}"; do
+            docker_ref="docker://docker.io/squadrules/mcp:${tag}"
+            quay_ref="docker://${QUAY_IMAGE}:${tag}"
+            docker_digest="$(skopeo inspect --authfile "${authfile}" --format '{{.Digest}}' "${docker_ref}" 2>/dev/null)" \
+              || { echo "::error::Publish verification failed for docker.io/squadrules/mcp:${tag}"; failed=true; }
+            quay_digest="$(skopeo inspect --authfile "${authfile}" --format '{{.Digest}}' "${quay_ref}" 2>/dev/null)" \
+              || { echo "::error::Publish verification failed for ${QUAY_IMAGE}:${tag}"; failed=true; }
+          done
+          
           if [ "${failed}" = "true" ]; then exit 1; fi
-          echo "Publish verified — docker.io/squadrules/mcp:${VERSION} digest ${docker_digest}; ${QUAY_IMAGE}:${VERSION} digest ${quay_digest}"
+          echo "Publish verified — fingerprint ${FINGERPRINT} and version ${VERSION} resolve in both registries"
 
   image-pipeline-pass:
     name: Container image pipeline passed
