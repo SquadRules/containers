@@ -172,6 +172,12 @@ pipeline. Triggers:
 - **`pull_request`** — build + smoke-test + scan **only** (no publish) to gate
   Dockerfile/`.trivyignore` changes.
 
+**Content-addressable build caching**: The resolve job computes a fingerprint from
+`sha256(Dockerfile + PACKAGE_VERSION)[:12]` and checks if it exists in both registries. When the
+fingerprint tag is present, the build is skipped entirely (avoiding 5-15 minutes of CI time). This
+is safe because same inputs = same fingerprint = same image. The fingerprint tag is published alongside
+the version tag for backward compatibility.
+
 Steps: resolve version (semver validated; the `publish` and `skip` outputs gate every
 downstream job) → `docker buildx build` (multi-arch OCI, with GitHub-Actions layer caching at
 `mode=max` so the base-image, `npm install` and model-bake layers are reused across PRs and the
