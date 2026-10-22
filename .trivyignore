@@ -18,6 +18,10 @@ CVE-2026-76642 exp:2027-04-01
 CVE-2026-78408 exp:2027-04-01
 CVE-2026-78409 exp:2027-04-01
 CVE-2026-78410 exp:2027-04-01
+# CVE-2026-53615 (util-linux family): same rationale as L10-14 — local issues in mount/nsenter/agetty
+# path handling, unreachable from the non-root, capability-dropped container.
+# Added: 2026-10-22, review by: 2027-04-01
+CVE-2026-53615 exp:2027-04-01
 
 # CVE-2025-69720 (ncurses/libtinfo6/ncurses-bin): terminfo parsing. `libtinfo6` is a hard
 # dependency of bash (Essential), so it cannot be removed from a Debian base image; nothing in
@@ -74,4 +78,4 @@ CVE-2026-88648 exp:2027-04-01
 # CVE-2026-57433, CVE-2026-8376 (perl-base): fixed by the `apt-get upgrade` layer in the
 # os-base stage (perl-base 5.36.0-7+deb12u3 -> 5.36.0-7+deb12u4); no ignore needed.
 # CVE-2026-45447 (OpenSSL Heap Use-After-Free in PKCS7_verify) resolved:
-# node:24-alpine digest updated to include OpenSSL 3.5.7-r0.
+# node:24-bookworm-slim digest updated to include OpenSSL 3.5.7-r0.

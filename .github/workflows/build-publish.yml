@@ -7,10 +7,12 @@
 # Decoupling contract: this pipeline is the ONLY place image build/scan/sign/publish
 # happens. An image/OS/library CVE here can never block an npm release or a code merge in
 # SquadRules/mcp. The mcp release pipeline publishes npm only; this repo builds images
-# independently via schedule (daily npm poll), workflow_dispatch, or pull_request.
+# independently via schedule (hourly npm poll), push (Dockerfile/trivyignore), workflow_dispatch, or pull_request.
 #
 # Triggers:
-#   - schedule (daily)                    — reconciliation against npm latest.
+#   - schedule (hourly)                   — reconciliation against npm latest.
+#   - push (main; mcp/Dockerfile, .trivyignore) — force-rebuild + republish when the
+#                                               image recipe or scan gate changes.
 #   - workflow_dispatch                   — manual build for an explicit version (or latest).
 #   - pull_request                        — build + smoke-test + scan ONLY (no publish) on every
 #                                           PR, so the "Container image pipeline passed" aggregate
@@ -21,7 +23,7 @@ name: Container image pipeline
 
 on:
   schedule:
-    - cron: '17 4 * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       version:
@@ -36,6 +38,11 @@ on:
         description: Build and scan only; do not sign, publish, promote, or dispatch
         type: boolean
         default: false
+  push:
+    branches: [main]
+    paths:
+      - 'mcp/Dockerfile'
+      - '.trivyignore'
   pull_request:
     branches: [main]
 
@@ -89,12 +96,13 @@ jobs:
           if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then publish=false; fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
-          # Idempotency: only skip when the canonical tag exists in BOTH registries and this
-          # is not a forced or manual run (keeps the daily reconciliation a no-op). Checking
-          # docker.io alone masked partial publishes: if docker.io succeeded but quay.io failed,
-          # every later run skipped and quay.io never caught up.
+          # Idempotency: only the scheduled reconciliation poll skips when the canonical tag
+          # exists in BOTH registries. Push events (Dockerfile/trivyignore changes) always
+          # rebuild to ensure the image reflects the latest recipe. Checking docker.io alone
+          # masked partial publishes: if docker.io succeeded but quay.io failed, every later
+          # run skipped and quay.io never caught up.
           skip=false
-          if [ "$publish" = "true" ] && [ "${INPUT_FORCE:-false}" != "true" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$publish" = "true" ] && [ "${INPUT_FORCE:-false}" != "true" ]; then
             sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y skopeo
             docker_ref="docker://docker.io/squadrules/mcp:${version}"
             quay_ref="docker://quay.io/${QUAY_NAMESPACE}/mcp:${version}"
