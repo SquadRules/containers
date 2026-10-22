@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/SquadRules/containers/compare/v1.0.0...v1.1.0) (2026-10-22)
+
+
+### Features
+
+* content-addressable build fingerprint to skip redundant rebuilds ([#15](https://github.com/SquadRules/containers/issues/15)) ([77d2519](https://github.com/SquadRules/containers/commit/77d251997e257dccb3054fd0cbbc27460b02429d))
+
 ## 1.0.0 (2026-10-22)
 
 
