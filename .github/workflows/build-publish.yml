@@ -181,13 +181,13 @@ jobs:
               inline_cache=""
               ;;
             registry)
-              cache_from="--cache-from type=registry,ref=ghcr.io/${GITHUB_REPOSITORY}:buildcache"
-              cache_to="--cache-to type=registry,ref=ghcr.io/${GITHUB_REPOSITORY}:buildcache,mode=max"
+              cache_from="--cache-from type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache"
+              cache_to="--cache-to type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache,mode=max"
               inline_cache="--build-arg BUILDKIT_INLINE_CACHE=1"
               ;;
             hybrid)
-              cache_from="--cache-from type=gha --cache-from type=registry,ref=ghcr.io/${GITHUB_REPOSITORY}:buildcache"
-              cache_to="--cache-to type=gha,mode=max --cache-to type=registry,ref=ghcr.io/${GITHUB_REPOSITORY}:buildcache,mode=max"
+              cache_from="--cache-from type=gha --cache-from type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache"
+              cache_to="--cache-to type=gha,mode=max --cache-to type=registry,ref=ghcr.io/$(echo ${GITHUB_REPOSITORY} | tr '[:upper:]' '[:lower:]'):buildcache,mode=max"
               inline_cache="--build-arg BUILDKIT_INLINE_CACHE=1"
               ;;
             *)
