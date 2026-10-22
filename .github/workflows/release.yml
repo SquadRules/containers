@@ -112,6 +112,42 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `branch=${pr.headBranchName}\nnumber=${pr.number}\n`);
           NODE
 
+  auto-merge-release-pr:
+    needs: release-please
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Create repository-scoped SquadRules auto App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-statuses: read
+
+      - name: Enable auto-merge on Release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_PR: ${{ needs.release-please.outputs.pr_number }}
+          RELEASE_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR" | jq -e \
+            --arg repo "$GITHUB_REPOSITORY" --arg branch "$RELEASE_BRANCH" \
+            '.state == "open" and .draft == false and .base.ref == "main" and
+             .base.repo.full_name == $repo and .head.repo.full_name == $repo and
+             .head.ref == $branch and
+             any(.labels[]; .name == "autorelease: pending")' >/dev/null
+          gh pr merge "$RELEASE_PR" --repo "$GITHUB_REPOSITORY" --auto --squash
+
   publish:
     needs: release-please
     if: >-
