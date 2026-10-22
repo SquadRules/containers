@@ -5,13 +5,13 @@
 #
 # Triggers: workflow_dispatch (manual) and push to main when wiki source or the
 # wiki plan changes. The docs bot uses QODER_PERSONAL_ACCESS_TOKEN to run the
-# Qoder CLI wiki generation, and DOCS_APP_ID + DOCS_APP_PRIVATE_KEY to create
+# Qoder CLI wiki generation, and AUTO_APP_ID + AUTO_APP_PRIVATE_KEY to create
 # and auto-merge the PR.
 #
 # Required secrets / vars:
 #   - QODER_PERSONAL_ACCESS_TOKEN   Qoder CLI auth for wiki generation.
-#   - DOCS_APP_PRIVATE_KEY          Docs GitHub App private key.
-#   - DOCS_APP_ID                   Docs GitHub App ID (var).
+#   - AUTO_APP_PRIVATE_KEY          SquadRules auto GitHub App private key.
+#   - AUTO_APP_ID                   SquadRules auto GitHub App ID (var).
 #
 # Required repo state:
 #   - Wiki tab initialised (visit /wiki/create once).
@@ -45,8 +45,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ vars.DOCS_APP_ID }}
-          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
 
       - name: Checkout
@@ -116,8 +116,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ vars.DOCS_APP_ID }}
-          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
 
       - name: Auto-merge the docs PR
@@ -146,8 +146,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ vars.DOCS_APP_ID }}
-          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
 
       - name: Checkout source repository

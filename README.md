@@ -160,9 +160,13 @@ coupling that made the old Alpine version of that job brittle.
 [`.github/workflows/build-publish.yml`](.github/workflows/build-publish.yml) — the image
 pipeline. Triggers:
 
-- **`schedule` (daily, 04:17 UTC)** — reconciliation against npm `latest`. No-op only when the
+- **`schedule` (hourly, :17)** — reconciliation against npm `latest`. No-op only when the
   tag exists in **both** registries; a tag present on docker.io but missing on quay.io is
   reported as a partial publish and the run continues so quay.io catches up.
+- **`push` (main; `mcp/Dockerfile`, `.trivyignore` only)** — force-rebuild and republish the
+  current npm-latest version when the image definition or vulnerability gate changes. CI-only
+  edits (`.github/workflows/**`, `scripts/**`, docs) are excluded by the paths filter and never
+  trigger a release.
 - **`workflow_dispatch`** — manual build for an explicit `version` (or latest), with `force`
   and `dry-run` flags.
 - **`pull_request`** — build + smoke-test + scan **only** (no publish) to gate
@@ -197,7 +201,9 @@ an opaque push error.
 [`.github/workflows/security.yml`](.github/workflows/security.yml) — `.trivyignore` expiry
 guard, plus a Trivy scan of the `os-base` stage (`vuln-type: os`, CRITICAL,HIGH, `.trivyignore`)
 that auto-remediates by bumping the pinned base digest — which is how a newer Node patch release
-gets pulled in (PR flow commits to the branch; schedule/push flow opens an auto-merge PR). The OS
+gets pulled in (PR flow commits to the branch; schedule/push flow opens an auto-merge PR
+authored by `squadrules-auto[bot]` using the shared App token, so the resulting merge push
+can trigger `build-publish.yml` — `GITHUB_TOKEN` would be blocked by GitHub's recursion rule). The OS
 layer is built straight from the Dockerfile with `--target os-base` rather than re-assembled from
 grepped lines, so the job cannot drift from what ships; the replacement digest is resolved as the
 multi-arch **manifest index** digest via `docker buildx imagetools inspect` (a per-platform digest
@@ -213,7 +219,7 @@ group with `cancel-in-progress: true`, so only the latest run of a branch execut
 
 [`.github/workflows/docs.yml`](.github/workflows/docs.yml) — docs bot. Regenerates
 `.qoder/repowiki/en/content/` via the Qoder CLI when wiki source or the wiki plan changes on
-`main`, opens a docs-typed PR, auto-merges it via the `Docs` GitHub App, then publishes the
+`main`, opens a docs-typed PR, auto-merges it via the shared `squadrules-auto` GitHub App, then publishes the
 rebuilt content to the GitHub Wiki tab through
 [`scripts/sync-wiki.sh`](scripts/sync-wiki.sh) (which in turn calls
 [`scripts/build-wiki.mjs`](scripts/build-wiki.mjs) to flatten the nested Qoder tree into a
@@ -237,16 +243,24 @@ Secrets (repo → Settings → Secrets and variables → Actions):
 | `DOCKER_USERNAME` / `DOCKER_PASSWORD` | Docker Hub push |
 | `QUAY_USERNAME` / `QUAY_PASSWORD` | quay.io push |
 | `QODER_PERSONAL_ACCESS_TOKEN` | Qoder CLI auth for the docs-bot wiki regeneration |
-| `DOCS_APP_PRIVATE_KEY` | Docs GitHub App (opens + auto-merges the wiki-regen PR) |
-| `RELEASE_APP_PRIVATE_KEY` | Release GitHub App (release-please PRs and Release creation) |
+
+Secrets (org-level → Settings → Secrets and variables → Actions):
+
+| Secret | Purpose |
+|---|---|
+| `AUTO_APP_PRIVATE_KEY` | SquadRules auto GitHub App (opens + auto-merges wiki/release PRs, signs security auto-merge commits) |
 
 Variables:
 
 | Variable | Purpose |
 |---|---|
 | `QUAY_NAMESPACE` | quay.io namespace. Read as-is — nothing in the pipeline validates its shape, so a wrong or unset value surfaces as the quay.io reachability warning plus a failed publish/verify step |
-| `DOCS_APP_ID` | Docs GitHub App ID |
-| `RELEASE_APP_ID` | Release GitHub App ID |
+
+Variables (org-level):
+
+| Variable | Purpose |
+|---|---|
+| `AUTO_APP_ID` | SquadRules auto GitHub App ID |
 
 `cosign` keyless signing needs no secret; it uses the workflow's OIDC identity
 (`id-token: write`) and verifies against `https://github.com/${GITHUB_WORKFLOW_REF}`.
@@ -291,6 +305,7 @@ Current ADRs:
 - [0006](docs/adr/0006-http-healthcheck.md) — HTTP healthcheck
 - [0007](docs/adr/0007-sboms-as-artifacts.md) — SPDX SBOMs as CI artifacts, not registry attachments
 - [0008](docs/adr/0008-os-base-scan-target.md) — OS base scan target
+- [0009](docs/adr/0009-push-trigger-image-release-surface.md) — Push trigger as image release surface
 
 ## License and trademark
 

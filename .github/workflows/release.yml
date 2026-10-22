@@ -18,7 +18,7 @@
 #                        attaches them plus image references to the Release.
 #
 # Required secrets / vars:
-#   - RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY   GitHub App with contents:write
+#   - AUTO_APP_ID / AUTO_APP_PRIVATE_KEY   GitHub App with contents:write
 #                                                + pull-requests:write on this
 #                                                repo (release-please needs an
 #                                                App token; GITHUB_TOKEN cannot
@@ -71,12 +71,12 @@ jobs:
     steps:
       - name: Require unattended release credentials
         env:
-          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
-          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          RELEASE_APP_ID: ${{ vars.AUTO_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           if [ -z "$RELEASE_APP_ID" ] || [ -z "$RELEASE_APP_PRIVATE_KEY" ]; then
-            echo "::error::Configure RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY for the release GitHub App. GITHUB_TOKEN cannot produce unattended PR checks."
+            echo "::error::Configure AUTO_APP_ID and AUTO_APP_PRIVATE_KEY for the SquadRules auto GitHub App. GITHUB_TOKEN cannot produce unattended PR checks."
             exit 1
           fi
 
@@ -84,8 +84,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          app-id: ${{ vars.AUTO_APP_ID }}
+          private-key: ${{ secrets.AUTO_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
