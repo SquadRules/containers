@@ -7,12 +7,13 @@
 # Decoupling contract: this pipeline is the ONLY place image build/scan/sign/publish
 # happens. An image/OS/library CVE here can never block an npm release or a code merge in
 # SquadRules/mcp. The mcp release pipeline publishes npm only; this repo builds images
-# independently via schedule (hourly npm poll), push (Dockerfile/trivyignore), workflow_dispatch, or pull_request.
+# independently via schedule (hourly npm poll), push (Dockerfile/trivyignore/release-please), workflow_dispatch, or pull_request.
 #
 # Triggers:
 #   - schedule (hourly)                   — reconciliation against npm latest.
-#   - push (main; mcp/Dockerfile, .trivyignore) — force-rebuild + republish when the
-#                                               image recipe or scan gate changes.
+#   - push (main; mcp/Dockerfile, .trivyignore, .release-please-manifest.json,
+#           CHANGELOG.md)                 — force-rebuild + republish when the
+#                                           image recipe, scan gate, or release version changes.
 #   - workflow_dispatch                   — manual build for an explicit version (or latest).
 #   - pull_request                        — build + smoke-test + scan ONLY (no publish) on every
 #                                           PR, so the "Container image pipeline passed" aggregate
@@ -43,6 +44,8 @@ on:
     paths:
       - 'mcp/Dockerfile'
       - '.trivyignore'
+      - '.release-please-manifest.json'
+      - 'CHANGELOG.md'
   pull_request:
     branches: [main]
 
