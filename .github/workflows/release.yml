@@ -41,6 +41,7 @@ on:
     branches: [main]
     paths:
       - 'mcp/Dockerfile'
+      - '.package-version'
   workflow_dispatch:
     inputs:
       tag:
