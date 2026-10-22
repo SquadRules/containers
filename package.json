@@ -1,0 +1,9 @@
+{
+  "name": "squadrules-mcp-npm-container",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Minimal OCI packaging of the published SquadRules MCP npm release",
+  "dependencies": {
+    "@squadrules/mcp": "5.12.1"
+  }
+}

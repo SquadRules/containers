@@ -1,0 +1,19 @@
+# This file takes effect when this branch becomes the repository default branch.
+# For updates while this branch is non-default, put this configuration on main
+# and add target-branch: orphan/npm-ghcr to each updates entry.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
