@@ -1,0 +1,12 @@
+# `npm install` on the host creates this; only package.json and package-lock.json are
+# tracked, and the image installs with `npm ci` from the committed lockfile.
+node_modules/
+
+# Generated SBOMs and local image exports.
+sbom.spdx.json
+*.tar
+*.oci.tar
+.local/
+
+.DS_Store
+*.swp
