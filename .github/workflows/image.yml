@@ -6,10 +6,10 @@
 # quay.io — same digest in both, nothing to reconcile and no partial-publish state.
 #
 # Release isolation: the `push.paths` filter below is the whole mechanism. Dependabot bumps
-# package.json, the PR merges, publish runs. A workflow-only or README-only merge touches no
-# filtered path and never publishes. `pull_request` is deliberately UNFILTERED — a paths
-# filter there strands the required branch-protection check in Pending forever on any PR
-# that changes nothing it lists.
+# package.json, the PR merges, publish runs. A workflow-only or docs-only merge (README.md,
+# CONTRIBUTING.md) touches no filtered path and never publishes. `pull_request` is deliberately
+# UNFILTERED — a paths filter there strands the required branch-protection check in Pending forever
+# on any PR that changes nothing it lists.
 #
 # Secrets (repo level): DOCKER_USERNAME, DOCKER_PASSWORD, QUAY_USERNAME, QUAY_PASSWORD
 # Variables (repo level): DOCKER_NAMESPACE, QUAY_NAMESPACE, IMAGE_NAME
