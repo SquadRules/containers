@@ -120,13 +120,3 @@ The build downloads the default embedding model into `FASTEMBED_CACHE_DIR=/opt/s
 The `# check=skip=SecretsUsedInArgOrEnv` directive at the top of the Dockerfile silences one BuildKit
 lint false positive: the rule matches the `AUTH` substring in `AUTH_ENABLED`, which is a boolean
 rather than a credential. Every other lint check stays enabled.
-
-### The arm64 tokenizers override
-
-`package.json` pins `@anush008/tokenizers: ^0.6.0` in `overrides`. fastembed depends on `^0.0.0` of
-that package, which ships no linux-arm64 native binary; the override pulls in
-`@anush008/tokenizers-linux-arm64-gnu` so embedding works on arm64. This override is **permanent, not
-removable debt**: npm applies `overrides` only from the installed *root* project and ignores a
-dependency's own overrides, so even though `@squadrules/mcp` now carries the same override upstream
-([SquadRules/mcp#173](https://github.com/SquadRules/mcp/issues/173)), it does not propagate here,
-where the app is installed as a dependency.

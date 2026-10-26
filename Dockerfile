@@ -3,7 +3,8 @@
 
 # Packages the published @squadrules/mcp npm artifact. package.json is the build manifest and
 # Dependabot owns that pin plus the base digest, so there are zero required build args.
-# Runtime modes, environment variables and the pipeline are documented in README.md.
+# Runtime modes and environment variables are documented in README.md; the build pipeline, base
+# digest ownership and credentials are documented in CONTRIBUTING.md.
 
 # bookworm-slim, not Alpine: onnxruntime-node ships glibc-only binaries.
 FROM node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe
@@ -15,13 +16,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json ./
+COPY package.json ./
 
 # --ignore-scripts is load-bearing: the only install hook in the tree is onnxruntime-node's
 # postinstall, which downloads CUDA provider binaries on linux/x64. The CPU binaries are already
 # bundled, so skipping it keeps unused GPU libraries out. npm is then deleted — nothing at
 # runtime invokes it, and it removes a "run arbitrary registry code" primitive.
-RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund \
  && npm cache clean --force \
  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 

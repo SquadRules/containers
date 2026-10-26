@@ -22,8 +22,8 @@ updates:
       - image
     commit-message:
       prefix: build
-    # The pin is exact ("5.12.1"), and `increase` keeps it exact instead of widening it
-    # into a range — the lockfile and the manifest must agree for `npm ci` to work.
+    # The pin is exact ("5.13.5"), and `increase` keeps it exact instead of widening it
+    # into a range.
     versioning-strategy: increase
 
   # node:24-bookworm-slim digest pin. Also the OS CVE remediation path: Trivy in image.yml
