@@ -1,0 +1,248 @@
+# One workflow, two jobs. `build` gates every PR and every image-affecting push; `publish`
+# runs only after a push to main and is the only job that talks to a registry.
+#
+# There are no scripts in this repository. docker/metadata-action takes two `images:`, so a
+# single build-push-action call pushes the identical manifest index to docker.io and
+# quay.io — same digest in both, nothing to reconcile and no partial-publish state.
+#
+# Release isolation: the `push.paths` filter below is the whole mechanism. Dependabot bumps
+# package.json, the PR merges, publish runs. A workflow-only or README-only merge touches no
+# filtered path and never publishes. `pull_request` is deliberately UNFILTERED — a paths
+# filter there strands the required branch-protection check in Pending forever on any PR
+# that changes nothing it lists.
+#
+# Secrets (repo level): DOCKER_USERNAME, DOCKER_PASSWORD, QUAY_USERNAME, QUAY_PASSWORD
+# Variables (repo level): DOCKER_NAMESPACE, QUAY_NAMESPACE, IMAGE_NAME
+# No org-level credentials and no GitHub App token are used anywhere in this file.
+
+name: image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ${{ vars.DOCKER_NAMESPACE }}/${{ vars.IMAGE_NAME }}
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # The pinned app version, read from the manifest Dependabot owns. ${v%%.*} and ${v%.*}
+      # are bash parameter expansion, so no subprocess and no external parser.
+      - name: Resolve version
+        id: version
+        run: |
+          v=$(node -p "require('./package.json').dependencies['@squadrules/mcp']")
+          {
+            echo "version=$v"
+            echo "major=${v%%.*}"
+            echo "minor=${v%.*}"
+          } >> "$GITHUB_OUTPUT"
+
+      # provenance must be off here: `load: true` uses the docker exporter, which cannot
+      # carry attestation manifests, and build-push-action enables provenance by default on a
+      # public repo. Attestations are produced in the publish job, which pushes.
+      - name: Build (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches a manifest/lockfile disagreement, and proves the model bake actually landed
+      # rather than having warned and been skipped. Step-derived values reach the shell
+      # through `env`, never interpolated into the command line.
+      - name: Assert packaged version and baked model
+        env:
+          IMG: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          got=$(docker run --rm "$IMG" node -p "require('/app/node_modules/@squadrules/mcp/package.json').version")
+          if [ "$got" != "$EXPECTED_VERSION" ]; then
+            echo "::error::image contains @squadrules/mcp $got, expected $EXPECTED_VERSION"
+            exit 1
+          fi
+          if ! docker run --rm "$IMG" sh -c 'test -n "$(ls -A "$FASTEMBED_CACHE_DIR")"'; then
+            echo "::error::embedding model was not baked into $FASTEMBED_CACHE_DIR"
+            exit 1
+          fi
+          echo "ok: packaged $got, model baked"
+
+      # A real boot, not a `--help` check: /health only answers after startup has injected
+      # the bundled adapters, which exercises ONNX inference on the baked model. curl's
+      # --retry does the waiting, so there is no polling loop and no sleep.
+      #
+      # --retry-all-errors is load-bearing, not belt-and-braces. During boot the port starts
+      # accepting connections before the server answers, so curl hits "(52) Empty reply from
+      # server" — and plain --retry only treats timeouts and HTTP 408/429/5xx as transient, so
+      # it gives up immediately. Verified locally: without this flag the step fails spuriously
+      # after ~5s.
+      - name: Smoke test /health
+        env:
+          IMG: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+        run: |
+          docker run -d --init --name smoke -p 3000:3000 "$IMG"
+          if ! curl -fsS --retry 60 --retry-delay 5 --retry-all-errors http://localhost:3000/health; then
+            echo "::error::/health never became ready"
+            docker logs smoke
+            docker rm -f smoke
+            exit 1
+          fi
+          docker rm -f smoke
+          echo "ok: /health answered"
+
+      # ignore-unfixed is what replaces the old .trivyignore plus its expiry-governance
+      # subsystem. It fails only on findings Debian has actually fixed, and a Dependabot
+      # base-digest bump is exactly that fix. Findings with no upstream fix are skipped by
+      # construction instead of being tracked in a file that needed a validator.
+      - name: Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          format: spdx-json
+          output: sbom.spdx.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # cosign keyless signing via Fulcio OIDC
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve version
+        id: version
+        run: |
+          v=$(node -p "require('./package.json').dependencies['@squadrules/mcp']")
+          {
+            echo "version=$v"
+            echo "major=${v%%.*}"
+            echo "minor=${v%.*}"
+          } >> "$GITHUB_OUTPUT"
+
+      # QEMU rather than a native ubuntu-24.04-arm matrix: the arm64 work under emulation is
+      # `npm ci` (prebuilt binaries, --ignore-scripts, nothing compiled) plus a model file
+      # download — no inference. A matrix plus a `buildx imagetools create` merge would be
+      # faster but reintroduces the complexity this pipeline exists to avoid.
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to docker.io
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # QUAY_USERNAME is a robot account, formatted `namespace+robotname`, and the robot needs
+      # the `write` role on <QUAY_NAMESPACE>/<IMAGE_NAME>. Note that Quay's `qro_`-prefixed Robot API
+      # token is a different credential with a separate lifecycle and will NOT work here.
+      - name: Log in to quay.io
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      # type=raw, not type=semver: this repo has no git tags, the version comes from npm.
+      # The labels override metadata-action's defaults, which would otherwise derive the
+      # title from the repository name ("containers") and find no LICENSE file.
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            docker.io/${{ vars.DOCKER_NAMESPACE }}/${{ vars.IMAGE_NAME }}
+            quay.io/${{ vars.QUAY_NAMESPACE }}/${{ vars.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.minor }}
+            type=raw,value=${{ steps.version.outputs.major }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=SquadRules MCP
+            org.opencontainers.image.description=SquadRules MCP server for agent automation: persistent memory and deterministic workflow execution
+            org.opencontainers.image.vendor=SquadRules
+            org.opencontainers.image.licenses=MIT
+
+      # One build, both registries, one digest. Manifests are content-addressed, so the index
+      # pushed to quay.io is byte-identical to the one on docker.io.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Exact version, not a floating major: sigstore/cosign-installer publishes no `v4`
+      # tag, only v4.x.y, so `@v4` fails to resolve. Dependabot bumps it.
+      - uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign
+        env:
+          DOCKER_REF: docker.io/${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          QUAY_REF: quay.io/${{ vars.QUAY_NAMESPACE }}/${{ vars.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$DOCKER_REF"
+          cosign sign --yes "$QUAY_REF"
+
+      # The identity is pinned to this workflow's ref on main. Anything signed by a fork, a
+      # branch or a different workflow fails verification. NOTE: this regexp changed when the
+      # pipeline was rewritten — consumers still verifying against the old
+      # build-publish.yml@refs/heads/main identity must be updated.
+      - name: Verify signature
+        env:
+          DOCKER_REF: docker.io/${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/SquadRules/containers/\.github/workflows/image\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$DOCKER_REF"

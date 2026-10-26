@@ -1,0 +1,51 @@
+# Dependabot is the entire release mechanism for this repository.
+#
+# There is no version file, no marker, no release-please and no scheduled poll of npm.
+# The image version IS `package.json`'s `@squadrules/mcp` pin, so an `npm` update PR is
+# what carries a new upstream release into the image. Merging it touches a path in
+# image.yml's push filter, which builds and publishes; nothing else does.
+#
+# The `docker` ecosystem owns the base-image digest. This is safe to enable only because
+# the bespoke security workflow that used to rewrite that same line is gone — two writers
+# on one line would fight.
+
+version: 2
+
+updates:
+  # The one dependency that defines the image content. Bumping it is a release.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - image
+    commit-message:
+      prefix: build
+    # The pin is exact ("5.12.1"), and `increase` keeps it exact instead of widening it
+    # into a range — the lockfile and the manifest must agree for `npm ci` to work.
+    versioning-strategy: increase
+
+  # node:24-bookworm-slim digest pin. Also the OS CVE remediation path: Trivy in image.yml
+  # only fails on findings Debian has actually fixed, and a new base digest is the fix.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - image
+    commit-message:
+      prefix: build
+
+  # Every action referenced by .github/workflows/image.yml. Note that this path is
+  # deliberately outside image.yml's push filter, so CI-only changes never publish.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: ci
