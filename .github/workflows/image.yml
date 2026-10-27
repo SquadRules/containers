@@ -71,9 +71,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Catches a manifest/lockfile disagreement, and proves the model bake actually landed
-      # rather than having warned and been skipped. Step-derived values reach the shell
-      # through `env`, never interpolated into the command line.
+      # Proves the installed version matches the manifest pin and that the model bake
+      # actually landed rather than having warned and been skipped. Step-derived values
+      # reach the shell through `env`, never interpolated into the command line.
       - name: Assert packaged version and baked model
         env:
           IMG: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
@@ -161,7 +161,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # QEMU rather than a native ubuntu-24.04-arm matrix: the arm64 work under emulation is
-      # `npm ci` (prebuilt binaries, --ignore-scripts, nothing compiled) plus a model file
+      # `npm install` (prebuilt binaries, --ignore-scripts, nothing compiled) plus a model file
       # download — no inference. A matrix plus a `buildx imagetools create` merge would be
       # faster but reintroduces the complexity this pipeline exists to avoid.
       - uses: docker/setup-qemu-action@v4
