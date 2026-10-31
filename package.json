@@ -5,7 +5,7 @@
   "description": "Build manifest for the SquadRules MCP container image. The only dependency is the published @squadrules/mcp npm package; this repo ships no application source.",
   "license": "MIT",
   "dependencies": {
-    "@squadrules/mcp": "5.13.5"
+    "@squadrules/mcp": "5.13.8"
   },
   "overrides": {
     "qs": "^6.16.0",
