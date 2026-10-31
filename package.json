@@ -5,5 +5,8 @@
   "description": "Minimal OCI packaging of the published SquadRules MCP npm release",
   "dependencies": {
     "@squadrules/mcp": "5.14.3"
+  },
+  "overrides": {
+    "undici": "^8.12.3"
   }
 }
