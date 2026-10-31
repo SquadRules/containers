@@ -4,6 +4,6 @@
   "version": "0.0.0",
   "description": "Minimal OCI packaging of the published SquadRules MCP npm release",
   "dependencies": {
-    "@squadrules/mcp": "5.13.5"
+    "@squadrules/mcp": "5.14.3"
   }
 }
