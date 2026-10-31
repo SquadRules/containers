@@ -6,7 +6,8 @@ image, see [README.md](README.md).
 This repository holds no application source. It packages the already-published
 [`@squadrules/mcp`](https://www.npmjs.com/package/@squadrules/mcp) npm artifact into a multi-arch,
 scanned, signed OCI image. The image version *is* the npm pin — this repo mints no version of its
-own.
+own. The published MCP manifest is extracted as the application root, so its own
+npm security overrides apply; there is no duplicate overrides file here.
 
 ## How a release happens
 
@@ -54,10 +55,10 @@ cannot express.
   call, then signs and verifies with cosign keyless (Fulcio OIDC — no private key, no registry signing
   secret).
 
-Trivy runs with `ignore-unfixed: true`, so it fails only on CRITICAL/HIGH findings Debian has actually
-fixed. A Dependabot base-digest bump is that fix. This replaced the old `.trivyignore` file and its
-expiry-governance tooling: findings with no upstream fix are skipped by construction rather than
-tracked in a file that needed a validator.
+Trivy runs with `ignore-unfixed: true`, so it fails on fixable CRITICAL/HIGH findings in
+**both OS and npm dependencies**. OS patches generally arrive via a Dependabot base-digest bump;
+npm dependency fixes belong to the root manifest/lock supplied by `SquadRules/mcp`.
+This replaced the old `.trivyignore` and its expiry-governance tooling.
 
 The Dockerfile carries no `LABEL` instructions. `docker/metadata-action` emits the OCI label set
 (`title`, `description`, `url`, `source`, `version`, `created`, `revision`, `licenses`) from the
@@ -103,6 +104,14 @@ ships glibc-only binaries. `libgomp1` is installed for the same reason — it ba
 execution provider. The install runs with `--ignore-scripts`: the only install hook in the tree is
 `onnxruntime-node`'s postinstall, which downloads CUDA provider binaries on linux/x64, and the CPU
 binaries are already bundled in the tarball. Skipping it keeps unused GPU libraries out of the image.
+The container copies only its Dependabot-owned `package.json` as a version pointer, then downloads
+and extracts the published MCP tarball directly into `/app`. Installing with MCP as the **npm root**
+makes its `overrides` authoritative, including the arm64 tokenizer workaround. Recent MCP releases
+bundle `dist/runtime-lock.json` (generated from the tested upstream lockfile); the build restores
+it temporarily and installs with `npm ci --omit=dev`. Older releases without the bundled lock use
+`npm install --omit=dev` as a compatibility fallback. Neither path maintains transitive dependencies
+in this repository. Both temporary lockfiles are removed from the final image.
+
 The npm CLI is then deleted, so `npm ls` and `squadrules update` are unavailable inside the container.
 
 ### The baked model
@@ -110,7 +119,7 @@ The npm CLI is then deleted, so `npm ls` and `squadrules update` are unavailable
 The build downloads the default embedding model into `FASTEMBED_CACHE_DIR=/opt/squadrules/models`
 (~65 MB), so a zero-env boot needs no Hugging Face egress and pays no first-request latency.
 
-- The model id is read from the installed `@squadrules/mcp/dist/config.js` at build time, never
+- The model id is read from the published `/app/dist/config.js` at build time, never
   hardcoded, so the baked layout cannot drift from what the application looks for.
 - The cache lives outside `~/.config/squadrules` on purpose: mounting that directory to persist the
   embedded LanceDB store cannot shadow the weights.
@@ -120,13 +129,3 @@ The build downloads the default embedding model into `FASTEMBED_CACHE_DIR=/opt/s
 The `# check=skip=SecretsUsedInArgOrEnv` directive at the top of the Dockerfile silences one BuildKit
 lint false positive: the rule matches the `AUTH` substring in `AUTH_ENABLED`, which is a boolean
 rather than a credential. Every other lint check stays enabled.
-
-### The arm64 tokenizers override
-
-`package.json` pins `@anush008/tokenizers: ^0.6.0` in `overrides`. fastembed depends on `^0.0.0` of
-that package, which ships no linux-arm64 native binary; the override pulls in
-`@anush008/tokenizers-linux-arm64-gnu` so embedding works on arm64. This override is **permanent, not
-removable debt**: npm applies `overrides` only from the installed *root* project and ignores a
-dependency's own overrides, so even though `@squadrules/mcp` now carries the same override upstream
-([SquadRules/mcp#173](https://github.com/SquadRules/mcp/issues/173)), it does not propagate here,
-where the app is installed as a dependency.
