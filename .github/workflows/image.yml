@@ -79,7 +79,7 @@ jobs:
           IMG: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
           EXPECTED_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          got=$(docker run --rm "$IMG" node -p "require('/app/node_modules/@squadrules/mcp/package.json').version")
+          got=$(docker run --rm "$IMG" node -p "require('/app/package.json').version")
           if [ "$got" != "$EXPECTED_VERSION" ]; then
             echo "::error::image contains @squadrules/mcp $got, expected $EXPECTED_VERSION"
             exit 1
@@ -161,7 +161,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # QEMU rather than a native ubuntu-24.04-arm matrix: the arm64 work under emulation is
-      # `npm install` (prebuilt binaries, --ignore-scripts, nothing compiled) plus a model file
+      # `npm ci` for locked releases (or `npm install` for legacy releases) plus a model file
       # download — no inference. A matrix plus a `buildx imagetools create` merge would be
       # faster but reintroduces the complexity this pipeline exists to avoid.
       - uses: docker/setup-qemu-action@v4
